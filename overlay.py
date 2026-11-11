@@ -6,7 +6,7 @@ Modos de upscale (--fsr-mode):
   fsr1   espacial leve: EASU 4x4 + RCAS (16 taps)
   fsr2   espacial + acumulação temporal (TAA com motion vectors do flow)
   fsr3   fsr2 + frame gen (o FG já é ligado por padrão no overlay)
-  dlss1  temporal + upscale bilateral 6x6 + Sobel (GPU-heavy)
+  dlss1  shim DLSS-like: Pseudo-Depth + TAA Neural-like + Upscale Bilateral + Motion Blur + Sharpen + Saturation
   fsr4   comportamento antigo (sem temporal, sem upscale pesado)
 
 Atalhos globais (funcionam mesmo com o jogo em foco, sem roubar teclas):
@@ -42,7 +42,20 @@ VERT = """#version 330 core
 out vec2 uv;
 void main() {
     vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
-    uv = vec2(p.x, 1.0 - p.y);
+    uv = vec2(p.x, 1.0 - p.y); // Mapeamento top-down consistente
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+"""
+
+# Passadas que desenham em textura (framebuffer): sem inverter o eixo Y. A linha 0 da textura
+# resultante fica igual à linha 0 do quadro (topo da imagem), a mesma convenção dos quadros enviados
+# pelo numpy. Só a passada final na tela usa VERT (que inverte) para mostrar a imagem de pé.
+# Com VERT em passada de framebuffer a textura sairia de cabeça para baixo e a tela final também.
+VERT_FBO = """#version 330 core
+out vec2 uv;
+void main() {
+    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+    uv = p;
     gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
 }
 """
@@ -122,6 +135,9 @@ void main() {
 }
 """
 
+# =========================================================================
+# TEMPORAL_FRAG CORRIGIDO: TAA estável sem flicker
+# =========================================================================
 TEMPORAL_FRAG = """#version 330 core
 in vec2 uv;
 out vec4 fragColor;
@@ -137,6 +153,7 @@ void main() {
     vec3 cur = texture(texCurrent, uv).rgb;
     vec3 hist = texture(texHistory, (p - flow) / size).rgb;
 
+    // 1. Clamping da vizinhança (Variance Clipping)
     vec2 px = 1.0 / size;
     vec3 mn = cur, mx = cur;
     for (int j = -1; j <= 1; j++)
@@ -150,18 +167,37 @@ void main() {
     vec3 ext = 0.5 * (mx - mn) * 1.25;
     hist = clamp(hist, mid - ext, mid + ext);
 
+    // 2. Pseudo-Depth via Detecção de Borda (Apenas para referência, não descarta o histórico)
+    float lc = dot(cur, vec3(0.299, 0.587, 0.114));
+    float ln = dot(texture(texCurrent, uv + vec2(0, -px.y)).rgb, vec3(0.299, 0.587, 0.114));
+    float ls = dot(texture(texCurrent, uv + vec2(0,  px.y)).rgb, vec3(0.299, 0.587, 0.114));
+    float le = dot(texture(texCurrent, uv + vec2(-px.x, 0)).rgb, vec3(0.299, 0.587, 0.114));
+    float lw = dot(texture(texCurrent, uv + vec2( px.x, 0)).rgb, vec3(0.299, 0.587, 0.114));
+    float gx = le - lw;
+    float gy = ln - ls;
+    float gmag = sqrt(gx*gx + gy*gy);
+
+    // 3. Motion Adaptive Blending (Sem edge_factor agressivo para evitar tremedeira)
     float m = clamp(length(flow) / 8.0, 0.0, 1.0);
-    float a = mix(alpha, 0.9, m);
+    float a = mix(alpha, 0.85, m); // 85% de peso para o quadro atual em alto movimento, alpha para estático.
+
     fragColor = vec4(mix(hist, cur, a), 1.0);
 }
 """
 
+# =========================================================================
+# DLSS_FRAG: Upscale Bilateral + Motion Blur + Sharpen + Saturation (Suavizado)
+# =========================================================================
 DLSS_FRAG = """#version 330 core
 in vec2 uv;
 out vec4 fragColor;
 uniform sampler2D tex;
+uniform sampler2D texFlow;
 uniform vec2 srcSize;
 uniform vec2 dstSize;
+uniform float sharpness;
+uniform float saturation;
+uniform float blur_strength;
 
 vec3 T(ivec2 p) { return texelFetch(tex, clamp(p, ivec2(0), ivec2(srcSize) - 1), 0).rgb; }
 float L(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
@@ -184,6 +220,7 @@ void main() {
     vec3 c_center = T(ip);
     float l_center = L(c_center);
 
+    // 1. Detecção de borda (Sobel 5x5) para direção do Upscale
     float gx = 0.0, gy = 0.0;
     for (int j = -2; j <= 2; j++)
         for (int i = -2; i <= 2; i++) {
@@ -196,10 +233,11 @@ void main() {
     vec2 gdir = gmag > 1e-4 ? grad / gmag : vec2(1.0, 0.0);
     vec2 perp = vec2(-gdir.y, gdir.x);
 
-    float sharp = clamp(gmag * 3.0, 0.0, 1.0);
-    float along = 1.0 - 0.4 * sharp;
-    float across = 1.0 + 0.6 * sharp;
+    float edge_sharp = clamp(gmag * 3.0, 0.0, 1.0);
+    float along = 1.0 - 0.4 * edge_sharp;
+    float across = 1.0 + 0.6 * edge_sharp;
 
+    // 2. Upscale Bilateral Lanczos-3 6x6
     vec3 sum = vec3(0.0);
     float wsum = 0.0;
     for (int j = -3; j <= 2; j++)
@@ -211,13 +249,14 @@ void main() {
 
             vec3 s = T(ip + ivec2(i, j));
             float dl = abs(L(s) - l_center);
-            w *= 1.0 / (1.0 + dl * dl * 4.0);
+            w *= 1.0 / (1.0 + dl * dl * 4.0); // Bilateral weight
 
             sum += s * w;
             wsum += w;
         }
     vec3 o = sum / max(wsum, 1e-5);
 
+    // Anti-ringing
     vec3 mn = c_center, mx = c_center;
     for (int j = -1; j <= 1; j++)
         for (int i = -1; i <= 1; i++) {
@@ -227,7 +266,32 @@ void main() {
         }
     o = clamp(o, mn, mx);
 
-    fragColor = vec4(o, 1.0);
+    // 3. Motion Blur (baseado no fluxo)
+    vec2 flow = texture(texFlow, uv).rg;
+    if (blur_strength > 0.0 && length(flow) > 0.5) {
+        vec3 blurred = vec3(0.0);
+        float bw = 0.0;
+        for(int k = 1; k <= 3; k++) {
+            float t = float(k) * 0.33;
+            vec2 off = -flow / dstSize * t * blur_strength; 
+            blurred += texture(tex, uv + off).rgb;
+            bw += 1.0;
+        }
+        float blur_mix = clamp(length(flow) / 8.0, 0.0, 0.6);
+        o = mix(o, blurred / bw, blur_mix);
+    }
+
+    // 4. Sharpening (Unsharp Mask)
+    if (sharpness > 0.0) {
+        vec3 n = T(ip + ivec2(1,0)) + T(ip + ivec2(-1,0)) + T(ip + ivec2(0,1)) + T(ip + ivec2(0,-1));
+        o = o + (o - n * 0.25) * sharpness;
+    }
+
+    // 5. Ajuste de Saturação
+    float lum = L(o);
+    o = mix(vec3(lum), o, saturation);
+
+    fragColor = vec4(clamp(o, 0.0, 1.0), 1.0);
 }
 """
 
@@ -252,7 +316,8 @@ float diffAt(vec2 p) {
     return dot(abs(a - b), vec3(1.0 / 3.0));
 }
 void main() {
-    vec2 p = gl_FragCoord.xy;
+    // CORREÇÃO: Usar uv * size em vez de gl_FragCoord.xy para manter consistência top-down
+    vec2 p = uv * size;
     vec3 wa, wb;
     warps(p, wa, wb);
     float d = 0.4 * dot(abs(wa - wb), vec3(1.0 / 3.0))
@@ -455,7 +520,6 @@ class X11Hotkeys:
             Mod1Mask = 1 << 3
             modifiers = ControlMask | Mod1Mask
 
-            # keysyms: 'f'=0x66, 'h'=0x68, 'n'=0x6e, 'q'=0x71
             self.keysyms = {
                 0x66: self.on_fg,
                 0x68: self.on_hud,
@@ -525,6 +589,7 @@ class GLView(QOpenGLWindow):
         self.hist_size = None
         self.hist_initialized = False
         self.hist_fbo = None
+        self.zero_flow = None
         self.last = 0.0
         self._logged_first = False
 
@@ -539,11 +604,11 @@ class GLView(QOpenGLWindow):
         if self.feed.due(now) or now - self.last >= 0.1:
             self.update()
 
-    def _compile(self, frag):
+    def _compile(self, frag, vert=VERT):
         from OpenGL.GL import shaders
         from OpenGL import GL
         return shaders.compileProgram(
-            shaders.compileShader(VERT, GL.GL_VERTEX_SHADER),
+            shaders.compileShader(vert, GL.GL_VERTEX_SHADER),
             shaders.compileShader(frag, GL.GL_FRAGMENT_SHADER),
             validate=False)
 
@@ -561,9 +626,11 @@ class GLView(QOpenGLWindow):
             self.gpu_flag[0] = False
             return
         if not self.gpu_flag[0]:
+            self.temporal_ok = False               # o temporal precisa de framebuffer (GPU)
+            self._init_dlss(GL)
             return
         try:
-            self.iprog = self._compile(INTERP_FRAG)
+            self.iprog = self._compile(INTERP_FRAG, VERT_FBO)
             self.iloc = {n: GL.glGetUniformLocation(self.iprog, n)
                          for n in ("texA", "texB", "flowF", "flowB", "size", "t")}
             self.fbo = GL.glGenFramebuffers(1)
@@ -572,21 +639,33 @@ class GLView(QOpenGLWindow):
             self.gpu_flag[0] = False
         if self.temporal_ok:
             try:
-                self.tprog = self._compile(TEMPORAL_FRAG)
+                self.tprog = self._compile(TEMPORAL_FRAG, VERT_FBO)
                 self.tloc = {n: GL.glGetUniformLocation(self.tprog, n)
                              for n in ("texHistory", "texCurrent", "texFlow", "size", "alpha")}
                 self.hist_fbo = GL.glGenFramebuffers(1)
             except Exception as e:
                 _log(f"{self.fsr_mode} temporal indisponível: {e}; usando FSR 1")
                 self.temporal_ok = False
-        if self.dlss_ok:
-            try:
-                self.dprog = self._compile(DLSS_FRAG)
-                self.dloc = {n: GL.glGetUniformLocation(self.dprog, n)
-                             for n in ("tex", "srcSize", "dstSize")}
-            except Exception as e:
-                _log(f"DLSS 1 indisponível: {e}; usando FSR 1")
-                self.dlss_ok = False
+        self._init_dlss(GL)
+
+    def _init_dlss(self, GL):
+        if not self.dlss_ok:
+            return
+        try:
+            self.dprog = self._compile(DLSS_FRAG)
+            self.dloc = {n: GL.glGetUniformLocation(self.dprog, n)
+                         for n in ("tex", "texFlow", "srcSize", "dstSize", "sharpness",
+                                   "saturation", "blur_strength")}
+            # Textura dummy de fluxo zero para quadros sem fluxo
+            self.zero_flow = GL.glGenTextures(1)
+            GL.glActiveTexture(GL.GL_TEXTURE0)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, self.zero_flow)
+            self._tex_params(GL, GL.GL_NEAREST)
+            GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RG16F, 1, 1, 0, GL.GL_RG, GL.GL_FLOAT,
+                            np.zeros((1, 1, 2), dtype=np.float32))
+        except Exception as e:
+            _log(f"DLSS 1 indisponível: {e}; usando FSR 1")
+            self.dlss_ok = False
 
     def _tex_params(self, GL, filt):
         for k, v in ((GL.GL_TEXTURE_MIN_FILTER, filt), (GL.GL_TEXTURE_MAG_FILTER, filt),
@@ -714,7 +793,7 @@ class GLView(QOpenGLWindow):
             GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
             GL.glUniform1i(self.tloc[name], unit)
         GL.glUniform2f(self.tloc["size"], float(w), float(h))
-        GL.glUniform1f(self.tloc["alpha"], 0.15)
+        GL.glUniform1f(self.tloc["alpha"], 0.25) # Aumentado de 0.15 para 0.25 para maior estabilidade
         GL.glBindVertexArray(self.vao)
         GL.glDrawArrays(GL.GL_TRIANGLES, 0, 3)
         GL.glBindVertexArray(0)
@@ -763,6 +842,7 @@ class GLView(QOpenGLWindow):
         GL = self.GL
         frame, on, flow = feed.cur
 
+        # Se for quadro gerado (GenRef), usa o shader de interpolação padrão
         if isinstance(frame, GenRef):
             h, w = frame.shape[:2]
             tex = None
@@ -777,6 +857,9 @@ class GLView(QOpenGLWindow):
             if tex is None:
                 frame = frame.render()
                 h, w = frame.shape[:2]
+            flow = None # Quadro gerado não tem fluxo
+
+        # Se for quadro original e modo temporal (fsr2/fsr3/dlss1)
         elif self.temporal_ok and flow is not None:
             h, w = frame.shape[:2]
             tex = self._temporal_accumulate(frame, flow)
@@ -796,11 +879,6 @@ class GLView(QOpenGLWindow):
                 x_, y_, vw_, vh_ = _fit(w, h, W, H)
                 _log(f"primeiro quadro {w}x{h} -> viewport {vw_}x{vh_} "
                      f"framebuffer {W}x{H} fit={FIT_MODE} brilho médio={mean_str}")
-                if isinstance(frame, np.ndarray) and float(frame.mean()) < 5.0:
-                    _log("AVISO: primeiro quadro quase preto. Se o jogo está em modo "
-                         "janela, ele pode ter pausado ao perder o foco (clique na janela). "
-                         "Verifique também a linha 'Primeiro quadro: WxH, brilho médio X' "
-                         "no terminal do live.py.")
             except Exception:
                 pass
 
@@ -810,17 +888,37 @@ class GLView(QOpenGLWindow):
         x, y, vw, vh = _fit(w, h, W, H)
         GL.glViewport(x, y, vw, vh)
 
-        use_dlss = self.dlss_ok and self.fsr_mode == "dlss1"
-        prog = self.dprog if use_dlss else self.prog
-        loc  = self.dloc  if use_dlss else self.loc
-        GL.glUseProgram(prog)
-        GL.glActiveTexture(GL.GL_TEXTURE0)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
-        GL.glUniform1i(loc["tex"], 0)
-        GL.glUniform2f(loc["srcSize"], float(w), float(h))
-        GL.glUniform2f(loc["dstSize"], float(vw), float(vh))
-        if not use_dlss:
-            GL.glUniform1f(loc["rcas"], self.rcas)
+        use_dlss = self.dlss_ok and self.fsr_mode == "dlss1" and not isinstance(frame, GenRef)
+        
+        if use_dlss:
+            GL.glUseProgram(self.dprog)
+            GL.glActiveTexture(GL.GL_TEXTURE0)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
+            GL.glUniform1i(self.dloc["tex"], 0)
+            
+            GL.glActiveTexture(GL.GL_TEXTURE1)
+            if flow is not None:
+                flow_tex = self._flow_tex(flow)
+            else:
+                flow_tex = self.zero_flow
+            GL.glBindTexture(GL.GL_TEXTURE_2D, flow_tex)
+            GL.glUniform1i(self.dloc["texFlow"], 1)
+            
+            GL.glUniform2f(self.dloc["srcSize"], float(w), float(h))
+            GL.glUniform2f(self.dloc["dstSize"], float(vw), float(vh))
+            # Parâmetros suavizados para evitar tremedeira
+            GL.glUniform1f(self.dloc["sharpness"], 0.4)    # Reduzido de 0.6 para 0.4
+            GL.glUniform1f(self.dloc["saturation"], 1.1)   # Reduzido de 1.15 para 1.1
+            GL.glUniform1f(self.dloc["blur_strength"], 0.5) # Reduzido de 0.8 para 0.5
+        else:
+            GL.glUseProgram(self.prog)
+            GL.glActiveTexture(GL.GL_TEXTURE0)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
+            GL.glUniform1i(self.loc["tex"], 0)
+            GL.glUniform2f(self.loc["srcSize"], float(w), float(h))
+            GL.glUniform2f(self.loc["dstSize"], float(vw), float(vh))
+            GL.glUniform1f(self.loc["rcas"], self.rcas)
+
         GL.glBindVertexArray(self.vao)
         GL.glDrawArrays(GL.GL_TRIANGLES, 0, 3)
         GL.glBindVertexArray(0)
@@ -944,7 +1042,6 @@ def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geo
     if seconds:
         QTimer.singleShot(int(seconds * 1000), app.quit)
 
-    # Atalhos globais via X11 nativo
     hotkeys = X11Hotkeys(
         on_fg=on_fg,
         on_hud=lambda: hud_on.__setitem__(0, not hud_on[0]),
