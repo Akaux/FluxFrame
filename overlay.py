@@ -548,6 +548,11 @@ class GLView(QOpenGLWindow):
         GL.glClearColor(0, 0, 0, 1)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
         x, y, vw, vh = _fit(w, h, W, H)
+        key = (w, h, W, H)
+        if key != getattr(self, "_fit_logged", None):          # diagnóstico de faixas pretas
+            self._fit_logged = key
+            print(f"overlay: imagem {w}x{h} -> janela {W}x{H} | área desenhada "
+                  f"{vw}x{vh}+{x}+{y} | fit {FIT_MODE}", flush=True)
         GL.glViewport(x, y, vw, vh)
         GL.glUseProgram(self.prog)
         GL.glActiveTexture(GL.GL_TEXTURE0)

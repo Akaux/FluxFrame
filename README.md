@@ -160,7 +160,7 @@ python live.py --screen --overlay --fps 20 --mult 3     # captura a 20 fps  -> s
 
 Regras:
 
-- **Sem `--fps`:** a captura roda em `target-fps / N` (o alvo padrão é 60). Ex.: `--mult 4` captura a 15 fps.
+- **Sem `--fps`:** a captura roda em `target-fps / N` (o alvo padrão é 60) e a saída é **imposta** em `--target-fps`, mesmo que o jogo rode a outro fps (os quadros gerados completam o que falta; a captura é só o teto de quadros reais). Ex.: `--mult 4` captura a 15 fps e sai a 60. O monitor limita o que aparece: a 60 Hz, alvo 120 não é visível.
 - **Com `--fps`:** a saída é `fps × N`.
 - Sem `--mult`, o fator continua sendo `round(target-fps / fps)`, como antes.
 
@@ -286,7 +286,7 @@ Uma linha por segundo, com as colunas:
 | Opção | Padrão | Descrição |
 |---|---|---|
 | `--fps F` | 30 (ou alvo/N com `--mult`) | FPS de captura. |
-| `--target-fps F` | 60 | FPS de saída desejado (define o fator quando não há `--mult`). |
+| `--target-fps F` | 60 | FPS de saída imposto (sem `--fps`). Define também o fator quando não há `--mult`. |
 | `--mult N` | — | Multiplicador de 2 a 10. Ver [Multiplicador](#multiplicador-2x-a-10x). |
 
 ### Qualidade e desempenho
@@ -437,7 +437,7 @@ A razão de ampliação é a resolução do monitor sobre `--width`; ela **não*
 | Tela preta no overlay | Veja a linha `Primeiro quadro: ... brilho médio` no terminal; 0 = preto (a captura não está recebendo imagem). |
 | Mouse/teclado não chegam ao jogo | Procure `click-through não confirmado` ou `o overlay recebeu foco` no terminal. Tente `--managed`. Informe seu compositor. |
 | Overlay não aparece sobre o jogo | O jogo provavelmente está em tela cheia **exclusiva**; use borderless/janelado. |
-| Faixas pretas nas laterais/topo | Proporção do jogo difere do monitor em mais de 6%. Use `--fit stretch` ou `crop`, ou `--geometry`. Procure `geometria mudou` no terminal. |
+| Faixas pretas nas laterais/topo | Proporção do jogo difere do monitor em mais de 6% (ex.: janela maximizada que respeita o painel do Plasma). O painel já usa `--fit stretch`; na linha de comando use `--fit stretch` ou `crop`, ou `--geometry`. O log mostra `overlay: imagem WxH -> janela WxH | área desenhada ...` e, se existir, `geometria mudou`. |
 | `Atalhos globais indisponíveis` | `pip install evdev` e `sudo usermod -aG input $USER` (reinicie a sessão). Use os sinais enquanto isso. |
 | `OpenGL indisponível` | Cai para QPainter (lento). Verifique PyOpenGL e o driver; o overlay precisa de OpenGL 3.3 core. |
 | fps de saída oscila | Veja `proc`, `pulos`, `atrasos` e o 1% low. Aplique o [guia de ajuste](#guia-de-ajuste-de-desempenho). |

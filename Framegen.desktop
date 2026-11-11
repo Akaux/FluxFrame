@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Framegen
+Comment=Frame generation por software para jogos, em overlay
+Exec=sh -c 'exec "$(dirname "$1")/framegen"' sh %k
+Icon=framegen
+Categories=Game;Utility;
+Terminal=false
+StartupWMClass=framegen

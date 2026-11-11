@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Framegen
+GenericName=Geração de quadros
+Comment=Frame generation por software para jogos, em overlay
+Exec=framegen
+Icon=framegen
+Categories=Game;Utility;
+Keywords=fps;frame generation;overlay;
+Terminal=false
+StartupWMClass=framegen

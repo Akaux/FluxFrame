@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Framegen: lançador. Abre o painel com duplo clique (via Framegen.desktop) ou pelo terminal.
+# Funciona direto da pasta do projeto e também depois do install.sh.
+set -u
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+HERE="$(dirname "$SELF")"
+INSTALLED="${XDG_DATA_HOME:-$HOME/.local/share}/framegen"
+LOGDIR="${XDG_CACHE_HOME:-$HOME/.cache}/framegen-gui"
+mkdir -p "$LOGDIR"
+
+erro() {   # sem terminal (duplo clique) o erro precisa aparecer numa janela
+  echo "framegen: $1" >&2
+  echo "$(date '+%F %T') $1" >> "$LOGDIR/launcher.log"
+  if command -v kdialog >/dev/null 2>&1; then kdialog --title "Framegen" --error "$1" 2>/dev/null
+  elif command -v notify-send >/dev/null 2>&1; then notify-send -u critical "Framegen" "$1"; fi
+  exit 1
+}
+
+# pasta com o painel: a do próprio lançador ou a instalada
+APP=""
+for d in "$HERE" "$INSTALLED"; do
+  [[ -f "$d/framegen_gui.py" ]] && { APP="$d"; break; }
+done
+[[ -n "$APP" ]] || erro "framegen_gui.py não encontrado (procurei em $HERE e $INSTALLED). Rode: bash install.sh"
+
+# python: venv do projeto, venv instalado, ou o do sistema
+PY=""
+for c in "$APP/.venv/bin/python" "$INSTALLED/.venv/bin/python" "$(command -v python3 || true)"; do
+  [[ -n "$c" && -x "$c" ]] && "$c" -c "import PySide6" 2>/dev/null && { PY="$c"; break; }
+done
+[[ -n "$PY" ]] || erro "PySide6 não encontrado. Rode: bash install.sh (ou: sudo pacman -S pyside6)"
+
+cd "$APP" || exit 1
+if [[ -t 1 ]]; then exec "$PY" "$APP/framegen_gui.py" "$@"        # terminal: mostra a saída
+else exec "$PY" "$APP/framegen_gui.py" "$@" >> "$LOGDIR/painel.log" 2>&1; fi

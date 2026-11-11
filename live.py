@@ -402,6 +402,9 @@ def main():
     p.add_argument("--bench-log", metavar="ARQ.csv",
                    help="grava uma linha por segundo (fps do jogo, saída, 1%% low...)")
     args = p.parse_args()
+    # Alvo fixo: sem --fps, a saída é imposta em --target-fps (a captura vira apenas o teto de
+    # quadros reais usados). Com --fps explícito ("ilimitado"), saída = captura x multiplicador.
+    fixed_target = args.fps is None
     if args.fps is None:
         args.fps = args.target_fps / args.mult if args.mult else 30.0
     if args.flow:
@@ -427,6 +430,11 @@ def main():
     interval = 1.0 / src.fps
     factor = args.mult or max(1, round(args.target_fps / src.fps))
     L = 2 * interval - interval / factor          # latência fixa (orçamento = 1 quadro de origem)
+    if fixed_target:
+        print(f"Alvo fixo: saída em {args.target_fps:g} fps (captura até {src.fps:g} fps, x{factor})",
+              flush=True)
+    else:
+        print(f"Sem alvo: saída = captura {src.fps:g} fps x {factor}", flush=True)
     canvas_w, canvas_h = src.size
 
     fg_on = [True]
@@ -487,6 +495,7 @@ def main():
             prev = letterbox(prev, canvas_w, canvas_h)
         pg = None                                  # (cinza reduzido de prev, escala) reaproveitado
         adapt_n = 0
+        carry = 0.0                                # erro de arredondamento acumulado (alvo fixo)
         while not stop.is_set():
             cur, t_cap, last_id, uid = src.get(last_id)
             if cur is None:
@@ -497,7 +506,13 @@ def main():
             cur = letterbox(cur, canvas_w, canvas_h)   # janela mudou de tamanho? encaixa
             gap = t_cap - prev_t                   # tempo real entre os dois quadros únicos
             n = int(round(gap / interval * factor))
-            if fg_on[0] and factor > 1 and n > 1 and gap <= 3.2 * interval:
+            want = n
+            if fixed_target:                       # quantos quadros cabem neste intervalo no alvo
+                want = gap * args.target_fps + carry
+                n = max(1, int(round(want)))
+            eligible = fg_on[0] and factor > 1 and gap <= 3.2 * interval
+            carry = max(-1.0, min(1.0, want - n)) if (fixed_target and eligible) else 0.0
+            if eligible and n > 1:
                 try:
                     t0 = time.perf_counter()
                     sc = qscale[0]

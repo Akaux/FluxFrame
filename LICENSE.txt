@@ -1,0 +1,107 @@
+FluxFrame - Licença de Uso Proprietária
+
+Copyright © 2026 Q1 / FluxFrame. Todos os direitos reservados.
+
+Este documento é um acordo entre você ("Usuário") e Q1 ("Titular"), responsável
+pelo FluxFrame. Ao instalar, copiar ou usar o Software, o Usuário concorda com
+estes termos. Se não concordar, não instale nem use o Software.
+
+
+1. DEFINIÇÕES
+
+"Software": o FluxFrame, incluindo código-fonte, scripts, ícones, documentação
+e quaisquer atualizações fornecidas pelo Titular.
+
+"Período de Lançamento Gratuito": o período em que o Titular disponibiliza o
+Software sem custo, encerrando-se na data que o Titular anunciar nos canais
+oficiais de distribuição do Software.
+
+"Uso Pessoal": uso por pessoa física, nos seus próprios dispositivos, sem
+finalidade comercial.
+
+
+2. CONCESSÃO DE USO
+
+Durante o Período de Lançamento Gratuito, o Titular concede ao Usuário uma
+licença pessoal, gratuita, limitada, não exclusiva, intransferível, não
+sublicenciável e revogável para instalar e usar o Software para Uso Pessoal,
+podendo manter uma cópia de segurança para esse fim.
+
+Nenhum outro direito é concedido. Tudo o que não está expressamente permitido
+nestes termos é reservado ao Titular.
+
+
+3. RESTRIÇÕES
+
+Sem autorização prévia e por escrito do Titular, é proibido:
+
+a) redistribuir o Software, no todo ou em parte, por qualquer meio (incluindo
+   hospedar, publicar, enviar ou compartilhar arquivos, repositórios, links
+   de download ou pacotes);
+
+b) comercializar o Software, no todo ou em parte: vender, alugar, licenciar,
+   sublicenciar ou incluí-lo em produto ou serviço, gratuito ou pago, de
+   terceiros, ou cobrar por acesso, instalação ou suporte a ele;
+
+c) modificar, adaptar ou criar obras derivadas do Software e republicá-las,
+   distribuí-las ou disponibilizá-las a terceiros;
+
+d) remover ou alterar avisos de copyright e de licença;
+
+e) usar o Software para fins comerciais.
+
+
+4. FIM DO PERÍODO DE LANÇAMENTO GRATUITO
+
+Encerrado o Período de Lançamento Gratuito, a licença da cláusula 2 termina. O
+uso continuado depende de nova licença ou de novos termos oferecidos pelo
+Titular. Versões já obtidas não conferem direito de uso após esse prazo.
+
+
+5. TITULARIDADE
+
+O Software é licenciado, não vendido. O Titular mantém todos os direitos,
+títulos e interesses sobre o Software, incluindo o nome FluxFrame.
+
+
+6. COMPONENTES DE TERCEIROS
+
+O Software usa ou depende de componentes de terceiros, que continuam regidos
+por suas próprias licenças, listadas em THIRD_PARTY_NOTICES.txt. Estes termos
+não restringem os direitos que essas licenças concedem sobre tais componentes.
+
+
+7. AVISO SOBRE JOGOS E SERVIÇOS DE TERCEIROS
+
+O Software captura a imagem de janelas e exibe um overlay. Alguns jogos e
+sistemas anti-cheat podem proibir ou detectar esse tipo de programa. O Usuário
+é responsável por verificar as regras dos jogos e serviços que usa com o
+Software.
+
+
+8. AUSÊNCIA DE GARANTIA
+
+O SOFTWARE É FORNECIDO "NO ESTADO EM QUE SE ENCONTRA", SEM GARANTIAS DE
+QUALQUER TIPO, EXPRESSAS OU IMPLÍCITAS, INCLUINDO ADEQUAÇÃO A UM FIM
+ESPECÍFICO, DESEMPENHO, COMPATIBILIDADE OU FUNCIONAMENTO SEM ERROS.
+
+
+9. LIMITAÇÃO DE RESPONSABILIDADE
+
+Na máxima extensão permitida pela lei aplicável, o Titular não responde por
+danos diretos ou indiretos decorrentes do uso ou da impossibilidade de uso do
+Software, incluindo perda de dados, falhas do sistema ou sanções aplicadas por
+jogos e serviços de terceiros.
+
+
+10. RESCISÃO
+
+Esta licença termina automaticamente se o Usuário violar qualquer um destes
+termos. Nesse caso, o Usuário deve parar de usar o Software e apagar todas as
+suas cópias.
+
+
+11. DISPOSIÇÕES GERAIS
+
+Autorizações do Titular só valem se dadas por escrito. Se alguma cláusula for
+considerada inválida, as demais continuam em vigor.
