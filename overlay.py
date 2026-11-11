@@ -38,6 +38,14 @@ from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QSurfaceForm
 from PySide6.QtOpenGL import QOpenGLWindow
 
 from framegen import GenRef
+from dlss5 import DLSS5Pipeline
+
+PASSTHROUGH_FRAG = """#version 330 core
+in vec2 uv;
+out vec4 fragColor;
+uniform sampler2D tex;
+void main() { fragColor = texture(tex, uv); }
+"""
 
 
 VERT = """#version 330 core
@@ -682,16 +690,24 @@ class X11Hotkeys:
 
 
 class GLView(QOpenGLWindow):
-    def __init__(self, feed, rcas, gpu_flag, fsr_mode="fsr1"):
+    def __init__(self, feed, rcas, gpu_flag, fsr_mode="fsr1", dlss5_strength=0.6):
         super().__init__()
         self.feed, self.rcas = feed, rcas
         self.gpu_flag = gpu_flag
         self.fsr_mode = fsr_mode
+        self.dlss5_strength = dlss5_strength
         self.gl_ok = True
         self.interp_ok = False
-        self.temporal_ok = fsr_mode in ("fsr2", "fsr3", "dlss1", "dlss3")
+        self.temporal_ok = fsr_mode in ("fsr2", "fsr3", "dlss1", "dlss3", "dlss5")
         self.dlss_ok = fsr_mode == "dlss1"
         self.dlss3_ok = fsr_mode == "dlss3"
+        self.dlss5_ok = fsr_mode == "dlss5"
+        self.dlss5 = None
+        self.dlss5_params = {
+            "strength": max(0.0, min(1.0, dlss5_strength)),
+            "ao": 0.7, "indirect": 0.6, "contrast": 0.4, "material": 0.8, "sr": 0.7,
+        }
+        self.p_passthrough = None
         self.frames = collections.OrderedDict()
         self.flows = collections.OrderedDict()
         self.fbo = self.fbo_tex = self.fbo_size = None
@@ -758,8 +774,26 @@ class GLView(QOpenGLWindow):
             except Exception as e:
                 _log(f"{self.fsr_mode} temporal indisponível: {e}; usando FSR 1")
                 self.temporal_ok = False
+        try:
+            self.p_passthrough = self._compile(PASSTHROUGH_FRAG, VERT_FBO)
+        except Exception:
+            self.p_passthrough = None
         self._init_dlss(GL)
         self._init_dlss3(GL)
+        self._init_dlss5(GL)
+
+    def _init_dlss5(self, GL):
+        if not self.dlss5_ok:
+            return
+        try:
+            self.dlss5 = DLSS5Pipeline()
+            compile_fbo = lambda f: self._compile(f, VERT_FBO)
+            self.dlss5.init_gl(GL, self.vao, self.defaultFramebufferObject(), compile_fbo)
+            _log("DLSS 5: pipeline inicializado (lighting + material + SR)")
+        except Exception as e:
+            _log(f"DLSS 5 indisponivel: {e}; usando FSR 1")
+            self.dlss5_ok = False
+            self.dlss5 = None
 
     def _init_dlss(self, GL):
         if not self.dlss_ok:
@@ -891,6 +925,27 @@ class GLView(QOpenGLWindow):
         GL.glActiveTexture(GL.GL_TEXTURE0)
         return self.fbo_tex
 
+    def _interp_texs(self, texA, texB, flowF, flowB, t, w, h):
+        GL = self.GL
+        self._ensure_fbo(w, h)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.fbo)
+        GL.glViewport(0, 0, w, h)
+        GL.glUseProgram(self.iprog)
+        for unit, (tex, name) in enumerate(zip(
+                (texA, texB, flowF, flowB), ("texA", "texB", "flowF", "flowB"))):
+            GL.glActiveTexture(GL.GL_TEXTURE0 + unit)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
+            GL.glUniform1i(self.iloc[name], unit)
+        GL.glUniform2f(self.iloc["size"], float(w), float(h))
+        GL.glUniform1f(self.iloc["t"], float(t))
+        GL.glBindVertexArray(self.vao)
+        GL.glDrawArrays(GL.GL_TRIANGLES, 0, 3)
+        GL.glBindVertexArray(0)
+        GL.glUseProgram(0)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.defaultFramebufferObject())
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        return self.fbo_tex
+
     def _temporal_accumulate(self, frame, flow):
         GL = self.GL
         h, w = frame.shape[:2]
@@ -914,6 +969,55 @@ class GLView(QOpenGLWindow):
         GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.hist_fbo)
         GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER, GL.GL_COLOR_ATTACHMENT0,
                                   GL.GL_TEXTURE_2D, self.hist_tex_b, 0)
+        GL.glViewport(0, 0, w, h)
+        GL.glUseProgram(self.tprog)
+        for unit, (tex, name) in enumerate(zip(
+                (self.hist_tex_a, cur_tex, flow_tex),
+                ("texHistory", "texCurrent", "texFlow"))):
+            GL.glActiveTexture(GL.GL_TEXTURE0 + unit)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
+            GL.glUniform1i(self.tloc[name], unit)
+        GL.glUniform2f(self.tloc["size"], float(w), float(h))
+        GL.glUniform1f(self.tloc["alpha"], 0.20)
+        GL.glBindVertexArray(self.vao)
+        GL.glDrawArrays(GL.GL_TRIANGLES, 0, 3)
+        GL.glBindVertexArray(0)
+        GL.glUseProgram(0)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.defaultFramebufferObject())
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        self.hist_tex_a, self.hist_tex_b = self.hist_tex_b, self.hist_tex_a
+        return self.hist_tex_a
+
+    def _temporal_accumulate_texs(self, cur_tex, flow_tex, w, h):
+        GL = self.GL
+        if self.hist_tex_a is None or self.hist_size != (w, h):
+            if self.hist_tex_a is not None:
+                GL.glDeleteTextures([self.hist_tex_a, self.hist_tex_b])
+            self.hist_tex_a = self._make_rgb8_tex(w, h)
+            self.hist_tex_b = self._make_rgb8_tex(w, h)
+            self.hist_size = (w, h)
+            self.hist_initialized = False
+        if not self.hist_initialized:
+            if self.p_passthrough is not None:
+                GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.hist_fbo)
+                GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER, GL.GL_COLOR_ATTACHMENT0,
+                                           GL.GL_TEXTURE_2D, self.hist_tex_a, 0)
+                GL.glViewport(0, 0, w, h)
+                GL.glUseProgram(self.p_passthrough)
+                GL.glActiveTexture(GL.GL_TEXTURE0)
+                GL.glBindTexture(GL.GL_TEXTURE_2D, cur_tex)
+                GL.glUniform1i(GL.glGetUniformLocation(self.p_passthrough, "tex"), 0)
+                GL.glBindVertexArray(self.vao)
+                GL.glDrawArrays(GL.GL_TRIANGLES, 0, 3)
+                GL.glBindVertexArray(0)
+                GL.glUseProgram(0)
+                GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.defaultFramebufferObject())
+                GL.glActiveTexture(GL.GL_TEXTURE0)
+            self.hist_initialized = True
+            return self.hist_tex_a
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.hist_fbo)
+        GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER, GL.GL_COLOR_ATTACHMENT0,
+                                   GL.GL_TEXTURE_2D, self.hist_tex_b, 0)
         GL.glViewport(0, 0, w, h)
         GL.glUseProgram(self.tprog)
         for unit, (tex, name) in enumerate(zip(
@@ -973,9 +1077,24 @@ class GLView(QOpenGLWindow):
         frame, on, flow = feed.cur
 
         if isinstance(frame, GenRef):
-            h, w = frame.shape[:2]
+            h, w = frame.cur.shape[:2]
             tex = None
-            if self.interp_ok:
+            if self.dlss5_ok and self.dlss5 is not None and self.interp_ok:
+                try:
+                    texA = self.dlss5.get_processed(
+                        frame.prev, self._frame_tex(frame.prev),
+                        self._flow_tex(frame.fw), w, h, self.dlss5_params)
+                    texB = self.dlss5.get_processed(
+                        frame.cur, self._frame_tex(frame.cur),
+                        self._flow_tex(frame.bw), w, h, self.dlss5_params)
+                    tex = self._interp_texs(
+                        texA, texB,
+                        self._flow_tex(frame.fw), self._flow_tex(frame.bw),
+                        frame.t, w, h)
+                except Exception as e:
+                    _log(f"DLSS 5 interp falhou: {e}")
+                    tex = None
+            if tex is None and self.interp_ok:
                 try:
                     tex = self._interp(frame)
                 except Exception:
@@ -986,6 +1105,24 @@ class GLView(QOpenGLWindow):
             if tex is None:
                 frame = frame.render()
                 h, w = frame.shape[:2]
+            flow = None
+        elif self.dlss5_ok and self.dlss5 is not None:
+            h, w = frame.shape[:2]
+            try:
+                enhanced = self.dlss5.get_processed(
+                    frame, self._frame_tex(frame),
+                    self._flow_tex(flow) if flow is not None else None,
+                    w, h, self.dlss5_params)
+                if self.temporal_ok and flow is not None:
+                    tex = self._temporal_accumulate_texs(
+                        enhanced, self._flow_tex(flow), w, h)
+                else:
+                    tex = enhanced
+            except Exception as e:
+                _log(f"DLSS 5 falhou: {e}; caindo para FSR 1")
+                self.dlss5_ok = False
+                tex = (self._temporal_accumulate(frame, flow)
+                       if (self.temporal_ok and flow is not None) else None)
             flow = None
         elif self.temporal_ok and flow is not None:
             h, w = frame.shape[:2]
@@ -1016,10 +1153,20 @@ class GLView(QOpenGLWindow):
         GL.glViewport(x, y, vw, vh)
 
         is_gen = isinstance(frame, GenRef)
-        use_dlss3 = self.dlss3_ok and not is_gen
-        use_dlss1 = self.dlss_ok and not is_gen and not use_dlss3
+        use_dlss3 = self.dlss3_ok and not is_gen and not self.dlss5_ok
+        use_dlss1 = self.dlss_ok and not is_gen and not use_dlss3 and not self.dlss5_ok
+        use_dlss5 = self.dlss5_ok and not is_gen
 
-        if use_dlss3:
+        if use_dlss5:
+            # DLSS5 ja processou: so upscale EASU (rcas=0 para nao double-sharpen)
+            GL.glUseProgram(self.prog)
+            GL.glActiveTexture(GL.GL_TEXTURE0)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
+            GL.glUniform1i(self.loc["tex"], 0)
+            GL.glUniform2f(self.loc["srcSize"], float(w), float(h))
+            GL.glUniform2f(self.loc["dstSize"], float(vw), float(vh))
+            GL.glUniform1f(self.loc["rcas"], 0.0)
+        elif use_dlss3:
             GL.glUseProgram(self.d3prog)
             GL.glActiveTexture(GL.GL_TEXTURE0)
             GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
@@ -1061,7 +1208,8 @@ class GLView(QOpenGLWindow):
 
 def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geometry=None,
                 soft=False, managed=False, mask=False, sharpness=0.2, seconds=0, fit="auto",
-                gpu_interp=None, tracker=None, follow_size=False, fsr_mode="fsr1"):
+                gpu_interp=None, tracker=None, follow_size=False, fsr_mode="fsr1",
+                dlss5_strength=0.6):
     global FIT_MODE
     FIT_MODE = fit
 
@@ -1108,7 +1256,8 @@ def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geo
     if soft:
         gpu[0] = False
     feed = Feed(q, st, present, hud_lines, hud_on, refresh)
-    view = GLView(feed, 0.0 if sharpness < 0 else 2.0 ** -sharpness, gpu, fsr_mode=fsr_mode)
+    view = GLView(feed, 0.0 if sharpness < 0 else 2.0 ** -sharpness, gpu,
+                  fsr_mode=fsr_mode, dlss5_strength=dlss5_strength)
     view.setTitle("framegen-overlay")
     view.setScreen(scr)
 

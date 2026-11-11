@@ -375,13 +375,15 @@ def main():
                    help="limite da largura de processamento no modo --width auto")
     p.add_argument("--window", metavar="TEXTO",
                    help="overlay: só considera janelas cujo título ou classe contém TEXTO")
-    p.add_argument("--fsr-mode", choices=("fsr1", "fsr2", "fsr3", "fsr4", "dlss1", "dlss3"), default="fsr1",
+    p.add_argument("--fsr-mode", choices=("fsr1", "fsr2", "fsr3", "fsr4", "dlss1", "dlss3", "dlss5"), default="fsr1",
                    help="upscaling quality: fsr1 (leve, espacial), fsr2 (acumulação temporal com "
                         "motion vectors do flow), fsr3 (fsr2 + frame gen; o FG já é ligado por "
                         "padrão no overlay), fsr4 (comportamento antigo com --scale-factor N), "
                         "dlss1 (GPU-heavy: 6x6 bilateral Lanczos-3 + Sobel, alivia a CPU), "
                         "dlss3 (Neural-like: Pseudo-Depth + Shadow Lift + Teal-Orange Grade)")
     p.add_argument("--scale-factor", type=int, default=1, help="ver --fsr-mode fsr4")
+    p.add_argument("--dlss5-strength", type=float, default=0.6, metavar="0..1",
+                   help="DLSS 5: forca dos efeitos (iluminacao+materiais+SR). 0=off, 1=maximo.")
     p.add_argument("--scale", type=float, default=0.25, help="escala máxima do cálculo do flow")
     p.add_argument("--no-auto", action="store_true", help="desliga a qualidade adaptativa")
     p.add_argument("--window-scale", type=float, default=1.0, help="zoom inicial da janela")
@@ -421,7 +423,7 @@ def main():
 
     sf = args.scale_factor if (args.fsr_mode == "fsr4" and args.scale_factor > 1) else 1
     total_mult = args.mult * sf if args.mult else None
-    needs_temporal = args.fsr_mode in ("fsr2", "fsr3", "dlss1", "dlss3")
+    needs_temporal = args.fsr_mode in ("fsr2", "fsr3", "dlss1", "dlss3", "dlss5")
 
     args.width_auto = str(args.width).strip().lower() == "auto"
     if args.width_auto:
@@ -699,7 +701,8 @@ def main():
                         managed=args.managed, mask=args.mask,
                         sharpness=args.sharpness, seconds=args.seconds,
                         fit=args.fit, gpu_interp=gpu_interp, tracker=tracker,
-                        follow_size=follow_size, fsr_mode=args.fsr_mode)
+                        follow_size=follow_size, fsr_mode=args.fsr_mode,
+                        dlss5_strength=args.dlss5_strength)
         else:
             window_loop()
     except KeyboardInterrupt:

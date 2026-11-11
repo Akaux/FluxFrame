@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""Framegen Control: painel minimalista com suporte a resolução automática."""
+"""Framegen Control — painel LANDSCAPE com suporte a DLSS 5."""
 import os
 import signal
 import subprocess
 import sys
-import time
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QTimer, QEvent
+from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtGui import QColor, QIcon, QPalette
-from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFrame,
-                               QHBoxLayout, QLabel, QLineEdit, QPushButton, QSlider, QVBoxLayout, QWidget,
-                               QRadioButton)
+from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QHBoxLayout,
+                               QLabel, QLineEdit, QPushButton, QSlider,
+                               QVBoxLayout, QWidget, QRadioButton)
 
 APP_DIR = Path(__file__).resolve().parent
 CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "framegen-gui"
@@ -19,36 +18,27 @@ LOG = CACHE / "ultima-execucao.log"
 TARGETS = (30, 45, 60, 75, 90, 120, 144, 165, 240, 0)
 START_MARKERS = ("Primeiro quadro", "SAIDA", "FG ON")
 
-# (valor, rótulo curto, descrição para o tooltip/hint)
 FSR_MODES = (
-    ("fsr1",  "FSR 1 — Espacial (leve)",
-     "EASU 4×4 + RCAS. Roda em qualquer GPU. É o modo mais leve."),
-    ("fsr2",  "FSR 2 — Temporal (TAA)",
-     "FSR 1 + acumulação temporal com motion vectors do flow. Reduz shimmer/aliasing."),
-    ("fsr3",  "FSR 3 — Temporal + FG",
-     "FSR 2 + frame gen (que já é ligado por padrão no overlay). Recomendado."),
-    ("dlss1", "DLSS 1 — GPU-heavy",
-     "Temporal + bilateral 6×6 + Sobel (144 reads/px). Alivia a CPU, pesa na GPU."),
-    ("dlss3", "DLSS 3 — Neural-like (cinematográfico)",
-     "TAA + Lanczos-2 4×4 + Pseudo-Depth + Shadow Lift + Midtone S-Curve (rostos) + Grade quente + Sharpening adaptativo."),
-    ("fsr4",  "FSR 4 — Escala ×N (legado)",
-     "Modo antigo: multiplica o fator de quadros por --scale-factor (1x/4x)."),
+    ("fsr1",  "FSR 1 — Espacial (leve)",     "EASU + RCAS. Roda em qualquer GPU."),
+    ("fsr2",  "FSR 2 — Temporal (TAA)",      "Acumulação temporal com motion vectors."),
+    ("fsr3",  "FSR 3 — Temporal + FG",       "FSR 2 + frame gen. Recomendado."),
+    ("dlss1", "DLSS 1 — GPU-heavy",          "TAA + bilateral 6×6 + Sobel."),
+    ("dlss3", "DLSS 3 — Cinematográfico",    "TAA + Lanczos-2 + grade quente + S-curve."),
+    ("dlss5", "DLSS 5 — Neural-like (α)",    "Iluminação + materiais + SR + TAA. Experimental."),
+    ("fsr4",  "FSR 4 — Escala ×N (legado)",  "Multiplica o fator por --scale-factor."),
 )
 
-# NOVO: estimadores de flow disponíveis no live.py
 FLOW_OPTS = (
-    ("farneback",    "Farneback (qualidade)",
-     "Melhor precisão do flow. ~12 ms a 320x180."),
-    ("dis-medium",   "DIS Medium",
-     "DIS médio. ~4.5 ms a 320x180."),
-    ("dis-fast",     "DIS Fast (~7×)",
-     "DIS rápido. ~1.6 ms a 320x180."),
-    ("dis-ultrafast","DIS Ultrafast (~24×)",
-     "DIS ultrafast. ~0.5 ms a 320x180."),
+    ("farneback",    "Farneback",  "Melhor precisão. ~12ms a 320x180."),
+    ("dis-medium",   "DIS Medium", "~4.5ms a 320x180."),
+    ("dis-fast",     "DIS Fast",   "~1.6ms a 320x180. ~7× mais rápido."),
+    ("dis-ultrafast","DIS Ultrafast","~0.5ms a 320x180. ~24× mais rápido."),
 )
 
-# NOVO: valores do slider de --scale (0 = qualidade, N = mais rápido)
 SCALE_VALUES = (0.25, 0.22, 0.20, 0.18, 0.16, 0.15, 0.13, 0.12)
+
+# Estágios visuais do DLSS 5 (os 6 do diagrama)
+DLSS5_STAGES = ("Captura", "Análise", "SR IA", "Iluminação", "Temporal", "Final")
 
 
 def build_args(cfg):
@@ -56,9 +46,9 @@ def build_args(cfg):
             "--width", str(cfg["width"]), "--output", str(cfg["monitor"]),
             "--fit", cfg["fit"], "--fsr-mode", cfg["fsr_mode"],
             "--scale-factor", str(cfg["scale_factor"]),
-            # NOVO: escala do flow e estimador
-            "--scale", str(cfg["scale"]),
-            "--flow", cfg["flow"]]
+            "--scale", str(cfg["scale"]), "--flow", cfg["flow"]]
+    if cfg["fsr_mode"] == "dlss5":
+        args += ["--dlss5-strength", str(cfg["dlss5_strength"])]
     if cfg.get("window"):
         args += ["--window", cfg["window"]]
     if cfg["unlimited"]:
@@ -120,9 +110,6 @@ class Runner:
             return
         self.tail = (self.tail + data.decode("utf-8", "replace"))[-6000:]
 
-    def started_ok(self):
-        return any(m in self.tail for m in START_MARKERS)
-
     def terminate(self):
         if self.alive():
             os.kill(self.proc.pid, signal.SIGTERM)
@@ -151,35 +138,45 @@ QSS = f"""
 QWidget#root {{ background: {BG}; }}
 QLabel#title {{ font-size: 20px; font-weight: 700; }}
 QLabel#dim {{ color: {DIM}; }}
-QLabel#section {{ color: {DIM}; font-size: 11px; font-weight: 600; }}
-QLabel#value {{ color: {ACCENT}; font-size: 24px; font-weight: 700; }}
-QLabel#valueSm {{ color: {ACCENT}; font-size: 16px; font-weight: 700; }}
+QLabel#section {{ color: {DIM}; font-size: 11px; font-weight: 600; letter-spacing: 1px; }}
+QLabel#value {{ color: {ACCENT}; font-size: 26px; font-weight: 700; }}
+QLabel#valueSm {{ color: {ACCENT}; font-size: 14px; font-weight: 700; }}
 QLabel#pill {{ background: {CARD}; border: 1px solid {EDGE}; border-radius: 10px;
                padding: 3px 11px; color: {DIM}; font-size: 12px; }}
 QLabel#pill[live="true"] {{ background: {ACCENT}; border-color: {ACCENT}; color: #0f1014; }}
 QFrame#card {{ background: {CARD}; border: 1px solid #262935; border-radius: 12px; }}
+QFrame#pipeline {{ background: transparent; border: none; }}
+QLabel#stage {{ background: #23262f; border: 1px solid #2a2d38; border-radius: 8px;
+                padding: 4px 10px; color: {DIM}; font-size: 10px; font-weight: 600; }}
+QLabel#stage[active="true"] {{ background: #3daee926; border-color: {ACCENT};
+                                color: {ACCENT}; }}
+QLabel#arrow {{ color: {DIM}; font-size: 12px; font-weight: 400; }}
 QPushButton#go {{ background: {ACCENT}; color: #0f1014; border: none; border-radius: 12px;
-                  padding: 15px; font-size: 15px; font-weight: 700; }}
+                  padding: 14px 24px; font-size: 15px; font-weight: 700; min-width: 260px; }}
 QPushButton#go:hover {{ background: #5bbcf0; }}
 QPushButton#go[mode="stop"] {{ background: #e5484d; color: #ffffff; }}
 QPushButton#link {{ background: transparent; border: none; color: {ACCENT}; padding: 4px; }}
 QSlider::groove:horizontal {{ height: 6px; background: {EDGE}; border-radius: 3px; }}
 QSlider::sub-page:horizontal {{ background: {ACCENT}; border-radius: 3px; }}
-QSlider::handle:horizontal {{ background: {TEXT}; width: 18px; height: 18px; margin: -6px 0; border-radius: 9px; }}
+QSlider::handle:horizontal {{ background: {TEXT}; width: 18px; height: 18px;
+                              margin: -6px 0; border-radius: 9px; }}
 QComboBox {{ background: {CARD}; border: 1px solid {EDGE}; border-radius: 8px;
              padding: 6px 10px; color: {TEXT}; min-height: 20px; }}
 QComboBox:hover {{ border-color: {ACCENT}; }}
 QComboBox QAbstractItemView {{ background: {CARD}; color: {TEXT};
                                selection-background-color: {ACCENT}; selection-color: #0f1014; }}
+QLineEdit {{ background: {CARD}; border: 1px solid {EDGE}; border-radius: 8px;
+             padding: 6px 10px; color: {TEXT}; }}
 """
 
 
 def dark_palette():
     p = QPalette()
-    R, G = QPalette.ColorRole, QPalette.ColorGroup
-    for role, col in ((R.Window, BG), (R.WindowText, TEXT), (R.Base, CARD), (R.AlternateBase, CARD),
-                      (R.Text, TEXT), (R.Button, CARD), (R.ButtonText, TEXT),
-                      (R.Highlight, ACCENT), (R.HighlightedText, "#0f1014")):
+    R = QPalette.ColorRole
+    for role, col in ((R.Window, BG), (R.WindowText, TEXT), (R.Base, CARD),
+                      (R.AlternateBase, CARD), (R.Text, TEXT), (R.Button, CARD),
+                      (R.ButtonText, TEXT), (R.Highlight, ACCENT),
+                      (R.HighlightedText, "#0f1014")):
         p.setColor(role, QColor(col))
     return p
 
@@ -204,7 +201,7 @@ class Panel(QWidget):
         self._build()
         self._load()
         self._refresh()
-        self.setFixedWidth(400)
+        self.setFixedWidth(1200)
         self.adjustSize()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
@@ -216,200 +213,239 @@ class Panel(QWidget):
         lb.setWordWrap(wrap)
         return lb
 
+    def _card(self):
+        f = QFrame()
+        f.setObjectName("card")
+        return f
+
     def _build(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(22, 20, 22, 18)
-        root.setSpacing(14)
+        root.setContentsMargins(20, 18, 20, 18)
+        root.setSpacing(12)
 
+        # ============================================================ HEADER
         head = QHBoxLayout()
         head.addWidget(self._label("Framegen Control", "title"))
+        head.addSpacing(16)
+        self.stage_strip_widget = self._make_pipeline_strip()
+        head.addWidget(self.stage_strip_widget)
         head.addStretch()
         self.pill = self._label("Parado", "pill")
         head.addWidget(self.pill)
         root.addLayout(head)
 
-        # ---------------- multiplicador
-        card = QFrame(); card.setObjectName("card")
-        cl = QVBoxLayout(card); cl.setContentsMargins(16, 14, 16, 16); cl.setSpacing(10)
-        row = QHBoxLayout()
-        row.addWidget(self._label("MULTIPLICADOR", "section"))
-        row.addStretch()
+        # ============================================================ CARDS (LINHA)
+        cards_row = QHBoxLayout()
+        cards_row.setSpacing(12)
+
+        # ---- Multiplicador
+        c1 = self._card()
+        l1 = QVBoxLayout(c1); l1.setContentsMargins(16, 14, 16, 16); l1.setSpacing(8)
+        r = QHBoxLayout()
+        r.addWidget(self._label("MULTIPLICADOR", "section"))
+        r.addStretch()
         self.val = self._label("2×", "value")
-        row.addWidget(self.val)
-        cl.addLayout(row)
+        r.addWidget(self.val)
+        l1.addLayout(r)
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(2, 10)
-        self.slider.setPageStep(1)
         self.slider.valueChanged.connect(self._refresh)
-        cl.addWidget(self.slider)
-        root.addWidget(card)
+        l1.addWidget(self.slider)
+        l1.addStretch()
+        cards_row.addWidget(c1, 2)
 
-        # ---------------- FSR / DLSS
-        card_fsr = QFrame(); card_fsr.setObjectName("card")
-        cf_l = QVBoxLayout(card_fsr); cf_l.setContentsMargins(16, 14, 16, 16); cf_l.setSpacing(10)
-        cf_l.addWidget(self._label("UPSCALER (FSR 1/2/3/4 e DLSS 1/3)", "section"))
-
+        # ---- Upscaler + DLSS5 strength
+        c2 = self._card()
+        l2 = QVBoxLayout(c2); l2.setContentsMargins(16, 14, 16, 16); l2.setSpacing(8)
+        l2.addWidget(self._label("UPSCALER", "section"))
         self.cb_fsr = QComboBox()
-        for val, label, _tip in FSR_MODES:
+        for val, label, _ in FSR_MODES:
             self.cb_fsr.addItem(label, val)
         self.cb_fsr.currentIndexChanged.connect(self._on_fsr_changed)
-        cf_l.addWidget(self.cb_fsr)
-
+        l2.addWidget(self.cb_fsr)
         self.fsr_hint = self._label("", "dim", True)
-        cf_l.addWidget(self.fsr_hint)
+        self.fsr_hint.setMinimumHeight(32)
+        l2.addWidget(self.fsr_hint)
 
-        scale_row = QHBoxLayout()
-        scale_row.addWidget(self._label("Escala de fluidez (FSR 4):"))
-        self.rb_scale1 = QRadioButton("1x (padrão)")
+        r = QHBoxLayout()
+        r.addWidget(self._label("Escala fluidez (FSR4):"))
+        self.rb_scale1 = QRadioButton("1x")
         self.rb_scale4 = QRadioButton("4x")
         self.rb_scale1.setChecked(True)
         self.rb_scale1.toggled.connect(self._refresh)
         self.rb_scale4.toggled.connect(self._refresh)
-        scale_row.addWidget(self.rb_scale1)
-        scale_row.addWidget(self.rb_scale4)
-        cf_l.addLayout(scale_row)
-        root.addWidget(card_fsr)
+        r.addWidget(self.rb_scale1)
+        r.addWidget(self.rb_scale4)
+        r.addStretch()
+        l2.addLayout(r)
 
-        # ---------------- NOVO: FLUXO (motion vectors)
-        card_flow = QFrame(); card_flow.setObjectName("card")
-        cfl = QVBoxLayout(card_flow); cfl.setContentsMargins(16, 14, 16, 16); cfl.setSpacing(10)
-        cfl.addWidget(self._label("FLUXO (motion vectors)", "section"))
+        # DLSS5 strength (aparece só no modo dlss5)
+        self.dlss5_row = QWidget()
+        dr = QVBoxLayout(self.dlss5_row); dr.setContentsMargins(0, 4, 0, 0); dr.setSpacing(4)
+        hdr = QHBoxLayout()
+        hdr.addWidget(self._label("DLSS 5 — Força", "section"))
+        hdr.addStretch()
+        self.lbl_dlss5 = self._label("0.60", "valueSm")
+        hdr.addWidget(self.lbl_dlss5)
+        dr.addLayout(hdr)
+        self.slider_dlss5 = QSlider(Qt.Orientation.Horizontal)
+        self.slider_dlss5.setRange(0, 100)
+        self.slider_dlss5.setValue(60)
+        self.slider_dlss5.valueChanged.connect(self._on_dlss5_strength)
+        dr.addWidget(self.slider_dlss5)
+        l2.addWidget(self.dlss5_row)
+        l2.addStretch()
+        cards_row.addWidget(c2, 3)
 
-        # slider --scale
-        row = QHBoxLayout()
-        row.addWidget(self._label("Escala do flow"))
-        row.addStretch()
+        # ---- Fluxo
+        c3 = self._card()
+        l3 = QVBoxLayout(c3); l3.setContentsMargins(16, 14, 16, 16); l3.setSpacing(8)
+        l3.addWidget(self._label("FLUXO (MOTION VECTORS)", "section"))
+        hdr = QHBoxLayout()
+        hdr.addWidget(self._label("Escala"))
+        hdr.addStretch()
         self.lbl_scale = self._label("0.25", "valueSm")
-        row.addWidget(self.lbl_scale)
-        cfl.addLayout(row)
+        hdr.addWidget(self.lbl_scale)
+        l3.addLayout(hdr)
         self.slider_scale = QSlider(Qt.Orientation.Horizontal)
         self.slider_scale.setRange(0, len(SCALE_VALUES) - 1)
-        self.slider_scale.setPageStep(1)
-        self.slider_scale.setValue(0)
         self.slider_scale.valueChanged.connect(self._on_scale_changed)
-        cfl.addWidget(self.slider_scale)
-
-        # combo --flow
-        row2 = QHBoxLayout()
-        row2.addWidget(self._label("Estimador"))
-        row2.addStretch()
+        l3.addWidget(self.slider_scale)
+        r = QHBoxLayout()
+        r.addWidget(self._label("Estimador"))
+        r.addStretch()
         self.cb_flow = QComboBox()
-        for val, lbl, _tip in FLOW_OPTS:
+        for val, lbl, _ in FLOW_OPTS:
             self.cb_flow.addItem(lbl, val)
-        self.cb_flow.currentIndexChanged.connect(self._on_flow_changed)
-        row2.addWidget(self.cb_flow)
-        cfl.addLayout(row2)
-
+        self.cb_flow.currentIndexChanged.connect(self._refresh)
+        r.addWidget(self.cb_flow)
+        l3.addLayout(r)
         self.flow_hint = self._label("", "dim", True)
-        cfl.addWidget(self.flow_hint)
+        l3.addWidget(self.flow_hint)
+        l3.addStretch()
+        cards_row.addWidget(c3, 2)
 
-        self.flow_effect = self._label("", "dim", True)
-        cfl.addWidget(self.flow_effect)
-        root.addWidget(card_flow)
-
-        # ---------------- FPS alvo
-        card2 = QFrame(); card2.setObjectName("card")
-        c2 = QVBoxLayout(card2); c2.setContentsMargins(16, 14, 16, 16); c2.setSpacing(10)
-        c2.addWidget(self._label("FPS ALVO", "section"))
+        # ---- FPS Alvo
+        c4 = self._card()
+        l4 = QVBoxLayout(c4); l4.setContentsMargins(16, 14, 16, 16); l4.setSpacing(8)
+        l4.addWidget(self._label("FPS ALVO", "section"))
         self.cb_target = QComboBox()
         for v in TARGETS:
             self.cb_target.addItem("Ilimitado" if v == 0 else f"{v} FPS", v)
         self.cb_target.currentIndexChanged.connect(self._refresh)
-        c2.addWidget(self.cb_target)
+        l4.addWidget(self.cb_target)
         self.hint = self._label("", "dim", True)
-        c2.addWidget(self.hint)
-
+        l4.addWidget(self.hint)
         self.cap_row = QWidget()
         cr = QHBoxLayout(self.cap_row); cr.setContentsMargins(0, 0, 0, 0)
-        cr.addWidget(self._label("FPS do jogo (captura)"))
+        cr.addWidget(self._label("Captura"))
         cr.addStretch()
         self.cb_fps = QComboBox()
         for v in (15, 20, 24, 30, 45, 60, 90, 120):
-            self.cb_fps.addItem(f"{v} fps", v)
+            self.cb_fps.addItem(f"{v}", v)
         self.cb_fps.currentIndexChanged.connect(self._refresh)
         cr.addWidget(self.cb_fps)
-        c2.addWidget(self.cap_row)
-        root.addWidget(card2)
+        l4.addWidget(self.cap_row)
+        l4.addStretch()
+        cards_row.addWidget(c4, 2)
 
+        root.addLayout(cards_row)
+
+        # ============================================================ INFO
         self.info = self._label("", "dim", True)
         self.info.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(self.info)
 
+        # ============================================================ AÇÕES
+        actions = QHBoxLayout()
         self.adv_btn = QPushButton("Avançado  ▸")
         self.adv_btn.setObjectName("link")
         self.adv_btn.clicked.connect(self._toggle_adv)
-        root.addWidget(self.adv_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+        actions.addWidget(self.adv_btn)
+        actions.addStretch()
+        self.go = QPushButton()
+        self.go.setObjectName("go")
+        self.go.clicked.connect(self._on_go)
+        actions.addWidget(self.go)
+        actions.addStretch()
+        actions.addSpacing(140)  # compensa o botão da esquerda
+        root.addLayout(actions)
 
-        # ---------------- avançado
-        self.adv = QFrame(); self.adv.setObjectName("card"); self.adv.hide()
-        al = QVBoxLayout(self.adv); al.setContentsMargins(16, 12, 16, 14); al.setSpacing(10)
+        # ============================================================ AVANÇADO
+        self.adv = self._card()
+        self.adv.hide()
+        al = QHBoxLayout(self.adv)
+        al.setContentsMargins(16, 12, 16, 14)
+        al.setSpacing(20)
 
         self.cb_width = QComboBox()
-        self.cb_width.addItem("Automática (Janela)", "auto")
-        for v, t in ((720, "720 px"), (960, "960 px"), (1280, "1280 px")):
+        self.cb_width.addItem("Automática", "auto")
+        for v, t in ((720, "720px"), (960, "960px"), (1280, "1280px")):
             self.cb_width.addItem(t, v)
-
         self.cb_fit = QComboBox()
         for v, t in (("stretch", "Preencher"), ("auto", "Automático")):
             self.cb_fit.addItem(t, v)
         self.cb_mon = QComboBox()
         for i, s in enumerate(QApplication.screens()):
-            self.cb_mon.addItem(f"{i + 1} · {s.name()}", i)
+            self.cb_mon.addItem(f"{i+1}·{s.name()}", i)
         self.ed_window = QLineEdit()
-        self.ed_window.setPlaceholderText("opcional: parte do título ou da classe")
-        self.ed_window.setToolTip("Resolução automática cobre a janela do app. Se o painel escolher "
-                                  "a janela errada, escreva aqui parte do título ou da classe dela.")
-        self.ed_window.setMinimumWidth(190)
-        for text, w in (("Resolução", self.cb_width), ("Janela alvo", self.ed_window),
-                        ("Monitor", self.cb_mon), ("Ajuste", self.cb_fit)):
-            r = QHBoxLayout(); r.addWidget(self._label(text)); r.addStretch(); r.addWidget(w)
-            al.addLayout(r)
+        self.ed_window.setPlaceholderText("título/classe da janela")
+        self.ed_window.setMinimumWidth(180)
+
+        for text, w in (("Resolução", self.cb_width), ("Ajuste", self.cb_fit),
+                        ("Monitor", self.cb_mon), ("Janela alvo", self.ed_window)):
+            col = QVBoxLayout()
+            col.addWidget(self._label(text, "section"))
+            col.addWidget(w)
+            al.addLayout(col)
+        al.addStretch()
         root.addWidget(self.adv)
 
-        self.go = QPushButton()
-        self.go.setObjectName("go")
-        self.go.clicked.connect(self._on_go)
-        root.addWidget(self.go)
-
+        # ============================================================ STATUS
         self.status = self._label("", "dim", True)
         self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(self.status)
 
-        # Todos os widgets existem: agora é seguro consultar _cfg() via _refresh().
         self._on_fsr_changed()
-        self._on_flow_changed()
 
-    # ------------------------------------------------------------------ FSR/DLSS
+    def _make_pipeline_strip(self):
+        """6 estágios do DLSS 5 (só visível quando fsr_mode == dlss5)."""
+        w = QWidget()
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        self.stage_labels = []
+        for i, name in enumerate(DLSS5_STAGES):
+            if i:
+                arrow = self._label("→", "arrow")
+                lay.addWidget(arrow)
+            lb = self._label(name, "stage")
+            lb.setProperty("active", "true")
+            self.stage_labels.append(lb)
+            lay.addWidget(lb)
+        w.hide()
+        return w
+
+    # -------------------------------------------------------------- handlers
     def _on_fsr_changed(self, *_):
         mode = self.cb_fsr.currentData() or "fsr1"
-        is_fsr4 = (mode == "fsr4")
+        is_fsr4 = mode == "fsr4"
+        is_dlss5 = mode == "dlss5"
         self.rb_scale1.setEnabled(is_fsr4)
         self.rb_scale4.setEnabled(is_fsr4)
         hint = next((h for v, _, h in FSR_MODES if v == mode), "")
         self.fsr_hint.setText(hint)
+        self.dlss5_row.setVisible(is_dlss5)
+        self.stage_strip_widget.setVisible(is_dlss5)
         self._refresh()
 
-    # NOVO: handlers do flow
     def _on_scale_changed(self, v):
         self.lbl_scale.setText(f"{SCALE_VALUES[v]:.2f}")
         self._refresh()
 
-    def _on_flow_changed(self, *_):
-        mode = self.cb_flow.currentData() or "farneback"
-        hint = next((h for v, _, h in FLOW_OPTS if v == mode), "")
-        self.flow_hint.setText(hint)
-        self._update_flow_effect()
+    def _on_dlss5_strength(self, v):
+        self.lbl_dlss5.setText(f"{v / 100:.2f}")
         self._refresh()
-
-    def _update_flow_effect(self):
-        scale = SCALE_VALUES[self.slider_scale.value()]
-        rel = (scale / 0.25) ** 2 * 100  # custo relativo aproximado vs 0.25
-        self.flow_effect.setText(
-            f"Custo de flow ≈ {rel:.0f}% do padrão (0.25). "
-            "Reduza até o HUD mostrar 'proc' bem abaixo do orçamento.")
-        self.flow_effect.setToolTip(
-            "O flow roda a cada quadro, mesmo com FG OFF em modos temporais. "
-            "Se 'proc' no HUD já está bem abaixo do orçamento, baixar mais não ganha FPS.")
 
     def _cfg(self):
         target = int(self.cb_target.currentData() or 0)
@@ -425,30 +461,31 @@ class Panel(QWidget):
                     window=self.ed_window.text().strip(),
                     fsr_mode=fsr_mode, scale_factor=scale_factor,
                     scale=SCALE_VALUES[self.slider_scale.value()],
-                    flow=str(self.cb_flow.currentData() or "farneback"))
+                    flow=str(self.cb_flow.currentData() or "farneback"),
+                    dlss5_strength=self.slider_dlss5.value() / 100.0)
 
     def _load(self):
         s = self.settings
         self.slider.setValue(s.value("mult", 2, type=int))
         self.ed_window.setText(s.value("window", "", type=str))
-        target_default = 0
-        i = self.cb_target.findData(target_default)
+        i = self.cb_target.findData(0)
         self.cb_target.setCurrentIndex(i if i >= 0 else 0)
-        saved_fsr = s.value("fsr_mode", "fsr1", type=str)
-        i = self.cb_fsr.findData(saved_fsr)
-        if i >= 0:
-            self.cb_fsr.setCurrentIndex(i)
-        # NOVO: carrega flow scale + estimador
-        scale_saved = s.value("scale", "0.25", type=str)
+        for name, widget, default in (("fsr_mode", self.cb_fsr, "fsr1"),
+                                      ("flow", self.cb_flow, "farneback")):
+            saved = s.value(name, default, type=str)
+            i = widget.findData(saved)
+            if i >= 0:
+                widget.setCurrentIndex(i)
         try:
-            idx = SCALE_VALUES.index(float(scale_saved))
+            idx = SCALE_VALUES.index(float(s.value("scale", "0.25", type=str)))
         except (ValueError, TypeError):
             idx = 0
         self.slider_scale.setValue(idx)
-        flow_saved = s.value("flow", "farneback", type=str)
-        i = self.cb_flow.findData(flow_saved)
-        if i >= 0:
-            self.cb_flow.setCurrentIndex(i)
+        try:
+            v = int(float(s.value("dlss5_strength", "0.6", type=str)) * 100)
+            self.slider_dlss5.setValue(max(0, min(100, v)))
+        except (ValueError, TypeError):
+            pass
 
     def _save(self):
         c = self._cfg()
@@ -461,9 +498,15 @@ class Panel(QWidget):
         cap, out, lat = rates(c)
         self.val.setText(f"{c['mult']}×")
         self.cap_row.setVisible(c["unlimited"])
-        self.hint.setText("Modo Ilimitado Ativo: O FPS de saída escala livremente com o FSR 4." if c["unlimited"]
-                          else f"Saída Fixa em {c['target']} FPS.")
-        self.info.setText(f"Captura {fmt(cap)} FPS  →  Saída Efetiva {fmt(out)} FPS  ·  Latência ≈ {lat:.0f} ms")
+        self.hint.setText("Ilimitado: FPS de saída escala livremente."
+                          if c["unlimited"] else f"Saída Fixa em {c['target']} FPS.")
+        if c["fsr_mode"] == "dlss5":
+            self.info.setText(
+                f"Captura {fmt(cap)} FPS → Saída {fmt(out)} FPS · Latência ≈ {lat:.0f} ms · "
+                f"DLSS 5 força {c['dlss5_strength']:.2f}")
+        else:
+            self.info.setText(
+                f"Captura {fmt(cap)} FPS → Saída {fmt(out)} FPS · Latência ≈ {lat:.0f} ms")
         self.adjustSize()
 
     def _toggle_adv(self):
@@ -474,11 +517,13 @@ class Panel(QWidget):
 
     def _set_phase(self, phase, note=""):
         self.phase = phase
-        self.go.setText({"idle": "▶   Iniciar Geração de Quadros", "running": "■   Parar"}[phase])
+        self.go.setText({"idle": "▶   Iniciar Geração de Quadros",
+                         "running": "■   Parar"}[phase])
         self.pill.setText({"idle": "Parado", "running": "Ativo"}[phase])
         self.pill.setProperty("live", "true" if phase == "running" else "false")
         repolish(self.pill)
-        self.status.setText(note or {"idle": "", "running": "Gerando quadros em alta fluidez"}[phase])
+        self.status.setText(note or {"idle": "",
+                                     "running": "Gerando quadros em alta fluidez"}[phase])
 
     def _on_go(self):
         if self.phase == "running":
