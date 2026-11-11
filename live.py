@@ -56,6 +56,8 @@ Exemplos:
   python live.py --screen --overlay --fps 30 --bench-log bench.csv --cv-threads 2
   python live.py --screen --overlay --mult 2 --width auto               # cobre a janela do app
   python live.py --screen --overlay --mult 2 --width auto --window "Meu Jogo"
+  python live.py --screen --overlay --width 960 --fsr-mode fsr2         # temporal
+  python live.py --screen --overlay --width 960 --fsr-mode dlss1        # GPU-heavy
 """
 import argparse
 import collections
@@ -195,9 +197,13 @@ class Source(threading.Thread):
             import struct
             import subprocess
             here = os.path.dirname(os.path.abspath(__file__))
+            # Em modo auto, deixa o portal entregar o tamanho NATIVO da janela (0 = sem escala
+            # no GStreamer). O Source._resize() depois reduz para --auto-max-width. Isso evita
+            # que uma detecção prévia errada force uma largura que não bate com a janela.
+            cap_w = 0 if getattr(self.args, "width_auto", False) else self.args.width
             proc = subprocess.Popen(
                 [sys.executable, os.path.join(here, "capture_wayland.py"),
-                 "--width", str(self.args.width), "--fps", str(self.fps),
+                 "--width", str(cap_w), "--fps", str(self.fps),
                  *(["--overlay"] if self.args.overlay else [])],
                 stdout=subprocess.PIPE)
 
@@ -233,20 +239,6 @@ class Source(threading.Thread):
 
 
 # --------------------------------------------------------------- main
-def resolve_width(args):
-    cap = args.auto_max_width
-    if not (args.screen and args.overlay):
-        return cap
-    w = winfind.find_once(text=args.window)
-    if w is None:
-        print(f"auto: janela do app não encontrada agora; processando em {cap} px "
-              "(o overlay a procura de novo depois).")
-        return cap
-    width = min(w.w, cap)
-    print(f"auto: janela '{w.title}' {w.w}x{w.h} -> processando em {width} px")
-    return width
-
-
 def sleep_until(t):
     d = t - time.perf_counter()
     if d > 0.002:
@@ -382,9 +374,12 @@ def main():
                    help="limite da largura de processamento no modo --width auto")
     p.add_argument("--window", metavar="TEXTO",
                    help="overlay: só considera janelas cujo título ou classe contém TEXTO")
-    p.add_argument("--fsr-mode", choices=("fsr1", "fsr4"), default="fsr1",
-                   help="fsr4 + --scale-factor N multiplica o fator de quadros por N (como no painel)")
-    p.add_argument("--scale-factor", type=int, default=1, help="ver --fsr-mode")
+    p.add_argument("--fsr-mode", choices=("fsr1", "fsr2", "fsr3", "fsr4", "dlss1"), default="fsr1",
+                   help="upscaling quality: fsr1 (leve, espacial), fsr2 (acumulação temporal com "
+                        "motion vectors do flow), fsr3 (fsr2 + frame gen; o FG já é ligado por "
+                        "padrão no overlay), fsr4 (comportamento antigo com --scale-factor N), "
+                        "dlss1 (GPU-heavy: 6x6 bilateral Lanczos-3 + Sobel, alivia a CPU)")
+    p.add_argument("--scale-factor", type=int, default=1, help="ver --fsr-mode fsr4")
     p.add_argument("--scale", type=float, default=0.25, help="escala máxima do cálculo do flow")
     p.add_argument("--no-auto", action="store_true", help="desliga a qualidade adaptativa")
     p.add_argument("--window-scale", type=float, default=1.0, help="zoom inicial da janela")
@@ -400,12 +395,12 @@ def main():
                         "proporção (barras pretas); crop = preenche cortando as bordas")
     p.add_argument("--soft", action="store_true", help="overlay sem OpenGL (QPainter, mais lento)")
     p.add_argument("--managed", action="store_true",
-                   help="overlay WM-gerenciado COM 'sempre no topo' (adicione se o overlay ficar "
-                        "atrás do jogo; ainda permite minimizar/Alt+Tab)")
+                   help="overlay WM-gerenciado COM 'sempre no topo' (é o padrão; flag mantida "
+                        "por compatibilidade)")
     p.add_argument("--mask", action="store_true",
                    help="overlay como MÁSCARA fullscreen override-redirect (X11BypassWindowManagerHint): "
-                        "fica acima de TUDO, inclusive do Alt+Tab — ÚLTIMO RECURSO. Combine com "
-                        "--no-global-hotkeys só se souber sair pelo terminal (pkill -TERM -f live.py)")
+                        "fica acima de TUDO, inclusive do Alt+Tab — ÚLTIMO RECURSO. Saia com "
+                        "pkill -TERM -f live.py se os atalhos globais não funcionarem")
     p.add_argument("--no-follow", action="store_true",
                    help="NÃO seguir a janela do jogo: cobre o monitor inteiro sem esconder ao "
                         "minimizar (comportamento antigo; combine com --geometry)")
@@ -421,18 +416,23 @@ def main():
     p.add_argument("--bench-log", metavar="ARQ.csv",
                    help="grava uma linha por segundo (fps do jogo, saída, 1%% low...)")
     args = p.parse_args()
+
     sf = args.scale_factor if (args.fsr_mode == "fsr4" and args.scale_factor > 1) else 1
     total_mult = args.mult * sf if args.mult else None
-    if not args.fps or args.fps <= 0:
-        args.fps = args.target_fps / total_mult if (total_mult and args.target_fps > 0) else 30.0
+    needs_temporal = args.fsr_mode in ("fsr2", "fsr3", "dlss1")
+
     args.width_auto = str(args.width).strip().lower() == "auto"
     if args.width_auto:
-        args.width = resolve_width(args)
+        args.width = args.auto_max_width
     else:
         try:
             args.width = int(args.width)
         except ValueError:
             p.error("--width deve ser um número ou 'auto'")
+
+    if not args.fps or args.fps <= 0:
+        args.fps = args.target_fps / total_mult if (total_mult and args.target_fps > 0) else 30.0
+    
     if args.flow:
         set_flow_method(args.flow)
     if args.cv_threads > 0:
@@ -441,6 +441,12 @@ def main():
         p.error("--overlay não combina com --headless nem --x11")
     if args.headless and not args.seconds:
         args.seconds = 8
+
+    if needs_temporal:
+        print(f"fsr_mode={args.fsr_mode}: acumulação temporal ativa "
+              "(o flow é calculado mesmo com FG OFF).")
+    if args.fsr_mode == "dlss1":
+        print("dlss1: shader GPU-heavy ativo — o gargalo migra da CPU para a GPU.")
 
     bench = Bench(args.bench_log)
     src = Source(args, bench)
@@ -455,11 +461,6 @@ def main():
 
     gpu_interp = [bool(args.overlay and not args.soft)]
 
-    # Tracker de janela: criado SEMPRE no modo overlay (exceto --geometry / --no-follow).
-    # Serve para: (a) seguir a janela do jogo (follow_size=True em modo auto/window);
-    # (b) esconder o overlay quando o jogo minimiza ou perde o foco (fallback do overlay.py).
-    # Com --mask o overlay é uma máscara fullscreen override-redirect e o WM não a gerencia;
-    # nesse caso só o polling do follow() consegue escondê-la (250 ms de atraso).
     tracker = None
     follow_size = False
     if args.overlay and not args.geometry and not args.no_follow:
@@ -468,7 +469,7 @@ def main():
             follow_size = True
         except winfind.WinFindError as e:
             print(f"overlay: não consigo acompanhar a janela do app ({e}); "
-                  "cobrindo o monitor e usando --mask como fallback.")
+                  "cobrindo o monitor (sem esconder ao minimizar).")
 
     fg_on = [True]
     hud_on = [True]
@@ -522,8 +523,12 @@ def main():
                 continue
             gap = t_cap - prev_t
             n = int(round(gap / interval * factor))
-            if (fg_on[0] and factor > 1 and n > 1 and gap <= 3.2 * interval
-                    and prev.shape == cur.shape):
+            same_size = prev.shape == cur.shape
+            need_interp = (fg_on[0] and factor > 1 and n > 1
+                           and gap <= 3.2 * interval and same_size)
+            need_hist = needs_temporal and same_size and gap <= 3.2 * interval
+            fw_for_hist = None
+            if need_interp or need_hist:
                 try:
                     t0 = time.perf_counter()
                     sc = qscale[0]
@@ -535,16 +540,18 @@ def main():
                     f_fw = pool.submit(flow_from_gray, pg[0], gc, sc, size)
                     f_bw = pool.submit(flow_from_gray, gc, pg[0], sc, size)
                     fw, bw = f_fw.result(), f_bw.result()
-                    for k in range(1, n):
-                        when = prev_t + L + k * gap / n
-                        if time.perf_counter() > when + 0.002:
-                            st["skipped"] += 1
-                            continue
-                        if gpu:
-                            q.put((when, GenRef(prev, cur, fw, bw, k / n), True))
-                        else:
-                            mid, _ = interpolate(prev, cur, k / n, fw, bw, scale=sc)
-                            q.put((when, mid, True))
+                    fw_for_hist = fw
+                    if need_interp:
+                        for k in range(1, n):
+                            when = prev_t + L + k * gap / n
+                            if time.perf_counter() > when + 0.002:
+                                st["skipped"] += 1
+                                continue
+                            if gpu:
+                                q.put((when, GenRef(prev, cur, fw, bw, k / n), True, None))
+                            else:
+                                mid, _ = interpolate(prev, cur, k / n, fw, bw, scale=sc)
+                                q.put((when, mid, True, None))
                     pg = (gc, sc)
                     proc_ms.append((time.perf_counter() - t0) * 1000)
                 except Exception as e:
@@ -564,7 +571,7 @@ def main():
                         adapt_n = 0
             else:
                 pg = None
-            q.put((t_cap + L, cur, fg_on[0]))
+            q.put((t_cap + L, cur, fg_on[0], fw_for_hist))
             prev, prev_uid, prev_t = cur, uid, t_cap
 
     zoom = [args.window_scale]
@@ -582,7 +589,8 @@ def main():
         game, out = bench.game_fps(now), bench.out_fps(now)
         gain = f"{(out / game - 1) * 100:+.0f}%" if game >= 1 else "--"
         l1 = (f"JOGO {game:3.0f} fps real | SAIDA {out:3.0f} fps | "
-              f"FG {'ON x' + str(factor) if label_on else 'OFF'} | ganho {gain}")
+              f"FG {'ON x' + str(factor) if label_on else 'OFF'} | "
+              f"{args.fsr_mode.upper()} | ganho {gain}")
         pc = bench.pacing(now)
         l2 = ("1% low --" if pc is None else
               f"1% low {pc[0]:3.0f} fps | frametime {pc[1]:4.1f} ms (pico {pc[2]:4.1f} ms)")
@@ -663,7 +671,7 @@ def main():
             if args.seconds and time.perf_counter() - start > args.seconds:
                 break
             try:
-                when, frame, on = q.get(timeout=0.5)
+                when, frame, on, _flow = q.get(timeout=0.5)
             except queue.Empty:
                 if src.ended:
                     break
@@ -689,7 +697,7 @@ def main():
                         managed=args.managed, mask=args.mask,
                         sharpness=args.sharpness, seconds=args.seconds,
                         fit=args.fit, gpu_interp=gpu_interp, tracker=tracker,
-                        follow_size=follow_size)
+                        follow_size=follow_size, fsr_mode=args.fsr_mode)
         else:
             window_loop()
     except KeyboardInterrupt:
@@ -711,6 +719,7 @@ def main():
     dur = time.perf_counter() - start
     print(f"\nDuração {dur:.1f}s | proc médio {np.mean(proc_ms) if proc_ms else 0:.0f} ms "
           f"(orçamento {interval * 1000:.0f} ms) | escala final {qscale[0]:.2f} | "
+          f"fsr_mode {args.fsr_mode} | "
           f"atrasos {st['late']} | pulos {st['skipped']} | repetidos {st['dup']} | "
           f"velhos {st['stale']} | erros {st['errors']} | descartes {src.dropped} | "
           f"resolução {src.size}")

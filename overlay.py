@@ -9,9 +9,12 @@ Modos de upscale (--fsr-mode):
   dlss1  temporal + upscale bilateral 6x6 + Sobel (GPU-heavy)
   fsr4   comportamento antigo (sem temporal, sem upscale pesado)
 
-Regra: o overlay SEMPRE cobre o monitor inteiro. O conteúdo é escalado pelo shader
-(EASU/RCAS ou DLSS_FRAG). `follow_size` controla apenas se o overlay troca de monitor
-quando a janela do jogo muda de monitor.
+Regra:
+- Se `follow_size=True` (padrão do painel em modo "Automático"), o overlay assume
+  exatamente a geometria da janela do jogo e a segue se ela for movida ou redimensionada.
+- Sem `follow_size` (ex.: `--geometry` explícito), cobre o `geometry` ou o monitor inteiro.
+- `mask=True` (`--mask`) bypassa o WM; nesse caso o overlay sempre cobre o monitor e
+  Alt+Tab fica travado.
 """
 import collections
 import ctypes
@@ -407,64 +410,6 @@ def set_transient_for(overlay_id, parent_id):
         return False
 
 
-def set_fullscreen_hint(win_id):
-    """Envia _NET_WM_STATE_FULLSCREEN ao WM. É o que faz o KDE esconder o painel/taskbar
-    por baixo do overlay, sem usar X11BypassWindowManagerHint (que travaria Alt+Tab).
-    Tudo dentro de try/except: se falhar, o overlay ainda funciona (só com o painel visível)."""
-    try:
-        x11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
-        x11.XOpenDisplay.restype = ctypes.c_void_p
-        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
-        x11.XInternAtom.restype = ctypes.c_ulong
-        x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
-        x11.XDefaultRootWindow.restype = ctypes.c_ulong
-        x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
-        x11.XSendEvent.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
-                                    ctypes.c_long, ctypes.c_void_p]
-        x11.XFlush.argtypes = [ctypes.c_void_p]
-        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
-
-        class _XClientMessageEvent(ctypes.Structure):
-            _fields_ = [
-                ("type", ctypes.c_int),
-                ("serial", ctypes.c_ulong),
-                ("send_event", ctypes.c_int),
-                ("display", ctypes.c_void_p),
-                ("window", ctypes.c_ulong),
-                ("message_type", ctypes.c_ulong),
-                ("format", ctypes.c_int),
-                ("data", ctypes.c_long * 5),
-            ]
-
-        dpy = x11.XOpenDisplay(None)
-        if not dpy:
-            _log("set_fullscreen_hint: XOpenDisplay falhou")
-            return
-        try:
-            root = x11.XDefaultRootWindow(dpy)
-            wm_state = x11.XInternAtom(dpy, b"_NET_WM_STATE", 0)
-            wm_fs = x11.XInternAtom(dpy, b"_NET_WM_STATE_FULLSCREEN", 0)
-            ev = _XClientMessageEvent()
-            ev.type = 33  # ClientMessage
-            ev.send_event = 1
-            ev.display = dpy
-            ev.window = int(win_id)
-            ev.message_type = wm_state
-            ev.format = 32
-            ev.data[0] = 1  # _NET_WM_STATE_ADD
-            ev.data[1] = wm_fs
-            ev.data[2] = 1  # source indication (1 = app normal)
-            ev.data[3] = 1  # initial
-            ev.data[4] = 0
-            mask = (1 << 20) | (1 << 19)  # SubstructureRedirect | SubstructureNotify
-            x11.XSendEvent(dpy, root, 0, mask, ctypes.byref(ev))
-            x11.XFlush(dpy)
-        finally:
-            x11.XCloseDisplay(dpy)
-    except Exception as e:
-        _log(f"set_fullscreen_hint falhou: {e}")
-
-
 def keep_click_through(view):
     set_click_through(view.winId())
     timer = QTimer(view)
@@ -796,18 +741,6 @@ class GLView(QOpenGLWindow):
 def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geometry=None,
                 soft=False, managed=False, mask=False, sharpness=0.2, seconds=0, fit="auto",
                 gpu_interp=None, tracker=None, follow_size=False, fsr_mode="fsr1"):
-    """Abre o overlay.
-
-    - O overlay sempre cobre o monitor inteiro; o shader escala o conteúdo (FSR/DLSS).
-    - `Qt::WindowDoesNotAcceptFocus` (flags) impede o `show()` de roubar o foco do jogo.
-    - Depois do `show()`, `_NET_WM_STATE_FULLSCREEN` é enviado via X11 para o WM esconder
-      o painel/taskbar por baixo do overlay (sem usar `X11BypassWindowManagerHint`).
-    - `mask=True` (`--mask`) volta ao comportamento antigo (bypassa o WM, Alt+Tab travado).
-
-    Todos os erros aqui são logados com prefixo `overlay:` no stderr — e o live.py
-    redireciona o stderr para `~/.cache/framegen-gui/ultima-execucao.log` quando
-    iniciado pelo painel.
-    """
     global FIT_MODE
     FIT_MODE = fit
 
@@ -835,17 +768,18 @@ def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geo
         except Exception as e:
             _log(f"tracker indisponível ({e})")
             tracker = None
-    if track_geo:
-        wx, wy, ww, wh = track_geo
-        scr = app.screenAt(QPoint(wx + ww // 2, wy + wh // 2)) or scr
-    elif tracker is not None:
-        _log(f"janela do app ainda não encontrada; usando {scr.name()} até achar.")
 
-    if geometry:
+    if follow_size and track_geo:
+        x, y, w, h = track_geo
+        scr = app.screenAt(QPoint(x + w // 2, y + h // 2)) or scr
+    elif geometry:
         x, y, w, h = (int(v) for v in geometry.split(","))
     else:
         g = scr.geometry()
         x, y, w, h = g.x(), g.y(), g.width(), g.height()
+        if tracker is not None and follow_size:
+            _log("janela do app ainda não encontrada; usando o monitor até achá-la.")
+
     refresh = scr.refreshRate() or 60.0
     _log(f"monitor '{scr.name()}' {w}x{h}+{x}+{y} refresh={refresh:.0f}Hz")
 
@@ -857,8 +791,6 @@ def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geo
     view.setTitle("framegen-overlay")
     view.setScreen(scr)
 
-    # Frame-less + topo + click-through + sem foco. NADA de Qt::Tool, senão o WM
-    # ignora _NET_WM_STATE_FULLSCREEN.
     flags = (Qt.WindowType.FramelessWindowHint
              | Qt.WindowType.WindowStaysOnTopHint
              | Qt.WindowType.WindowTransparentForInput
@@ -870,10 +802,7 @@ def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geo
     view.setGeometry(x, y, w, h)
     view.show()
     view.setGeometry(x, y, w, h)
-    _log(f"janela mostrada (winId=0x{int(view.winId()):x})")
-
-    if not mask:
-        set_fullscreen_hint(view.winId())
+    _log(f"janela mostrada (winId=0x{int(view.winId()):x}) {w}x{h}+{x}+{y}")
 
     keep_click_through(view)
 
@@ -901,18 +830,15 @@ def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geo
             set_click_through(view.winId())
             if tracker.win is not None:
                 reparent(tracker.win)
-        if not follow_size:
-            return
-        wx, wy, ww, wh = geo
-        new_scr = app.screenAt(QPoint(wx + ww // 2, wy + wh // 2))
-        if new_scr and new_scr != view.screen():
-            _log(f"janela mudou para o monitor '{new_scr.name()}'")
-            view.setScreen(new_scr)
-            g = new_scr.geometry()
-            view.setGeometry(g.x(), g.y(), g.width(), g.height())
-            if not mask:
-                set_fullscreen_hint(view.winId())
+        if follow_size:
+            if geo != cur_geo[0]:
+                _log(f"follow: setGeometry {geo} (anterior {cur_geo[0]})")
+                view.setGeometry(*geo)
+                cur_geo[0] = geo
+                if tracker.win is not None:
+                    reparent(tracker.win)
 
+    cur_geo = [(x, y, w, h)]
     follow_timer = QTimer()
     if tracker is not None:
         follow_timer.timeout.connect(follow)
