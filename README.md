@@ -125,12 +125,13 @@ python live.py --screen --x11 --region 0,0,1280,720    # X11 puro (mss), recorte
 
 ### Preencher a tela (`--fit`)
 
-O overlay mantém a proporção da imagem. Se a janela do jogo tiver proporção diferente do monitor,
-sobram faixas pretas:
+Por padrão (`auto`) o overlay preenche o monitor inteiro quando a proporção da imagem é quase a mesma
+(diferença < 6%) e só mantém a proporção, com faixas pretas, quando ela difere bastante:
 
 | Valor | Efeito |
 |---|---|
-| `fit` (padrão) | Mantém a proporção; faixas pretas se diferir do monitor. |
+| `auto` (padrão) | Preenche a tela se a proporção bate (< 6% de diferença); senão age como `fit`. |
+| `fit` | Sempre mantém a proporção; faixas pretas se diferir do monitor. |
 | `stretch` | Preenche tudo, deformando um pouco se as proporções diferem. |
 | `crop` | Preenche tudo mantendo a proporção, cortando as bordas. |
 
@@ -296,7 +297,10 @@ Uma linha por segundo, com as colunas:
 | `--scale S` | 0.25 | Escala **máxima** do fluxo óptico. |
 | `--no-auto` | — | Desliga a qualidade adaptativa (a escala fica fixa). |
 | `--flow M` | farneback | `farneback` (melhor qualidade) ou `dis-ultrafast`/`dis-fast`/`dis-medium` (bem mais rápidos, qualidade menor). |
-| `--cv-threads N` | 0 | Limita as threads do OpenCV (0 = padrão). Menos threads deixam CPU para o jogo. |
+| `--cv-threads N` | 2 | Threads do OpenCV (0 = todas). Menos threads deixam CPU para o jogo. |
+| `--nice N` | 5 | Prioridade do framegen e da captura (0..19). Maior = cede mais CPU ao jogo. |
+| `--single-flow` | — | Calcula só o fluxo A→B e deriva o inverso: metade do custo do fluxo, um pouco mais de artefato nas bordas. |
+| `--cpu-interp` | — | Overlay: força warp/mistura na CPU. Por padrão eles rodam na GPU (zero CPU). |
 
 ### Overlay
 
@@ -305,7 +309,7 @@ Uma linha por segundo, com as colunas:
 | `--overlay` | — | Mostra por cima da tela, click-through. |
 | `--output N` | 0 | Monitor do overlay. |
 | `--geometry x,y,l,a` | monitor inteiro | Região do overlay. |
-| `--fit M` | fit | `fit`, `stretch` ou `crop`. |
+| `--fit M` | auto | `auto`, `fit`, `stretch` ou `crop`. |
 | `--sharpness S` | 0.2 | Nitidez (RCAS): 0 = máxima, 2 = suave, negativo = desliga. |
 | `--soft` | — | Sem OpenGL (QPainter), bem mais pesado para a CPU. |
 | `--managed` | — | Janela normal (sem override-redirect), se o seu gerenciador de janelas reclamar. |
@@ -433,7 +437,7 @@ A razão de ampliação é a resolução do monitor sobre `--width`; ela **não*
 | Tela preta no overlay | Veja a linha `Primeiro quadro: ... brilho médio` no terminal; 0 = preto (a captura não está recebendo imagem). |
 | Mouse/teclado não chegam ao jogo | Procure `click-through não confirmado` ou `o overlay recebeu foco` no terminal. Tente `--managed`. Informe seu compositor. |
 | Overlay não aparece sobre o jogo | O jogo provavelmente está em tela cheia **exclusiva**; use borderless/janelado. |
-| Faixas pretas nas laterais/topo | Proporção do jogo ≠ monitor. Use `--fit stretch` ou `crop`, ou `--geometry`. |
+| Faixas pretas nas laterais/topo | Proporção do jogo difere do monitor em mais de 6%. Use `--fit stretch` ou `crop`, ou `--geometry`. Procure `geometria mudou` no terminal. |
 | `Atalhos globais indisponíveis` | `pip install evdev` e `sudo usermod -aG input $USER` (reinicie a sessão). Use os sinais enquanto isso. |
 | `OpenGL indisponível` | Cai para QPainter (lento). Verifique PyOpenGL e o driver; o overlay precisa de OpenGL 3.3 core. |
 | fps de saída oscila | Veja `proc`, `pulos`, `atrasos` e o 1% low. Aplique o [guia de ajuste](#guia-de-ajuste-de-desempenho). |

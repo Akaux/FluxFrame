@@ -28,7 +28,7 @@ class PortalCapture:
         self.overlay = overlay
         self._frame = None
         self._seq = 0                              # quadros REAIS recebidos do PipeWire (taxa do jogo)
-        self._lock = threading.Lock()
+        self._lock = threading.Condition()         # acorda o loop de envio quando chega quadro novo
         self._n = itertools.count(1)
         self.pipeline = None
 
@@ -122,6 +122,7 @@ class PortalCapture:
             with self._lock:
                 self._frame = frame
                 self._seq += 1
+                self._lock.notify_all()
         return Gst.FlowReturn.OK
 
     def latest(self):
@@ -133,6 +134,15 @@ class PortalCapture:
         """(último quadro, contador de quadros reais). O contador só sobe quando o jogo entrega
         um quadro novo; o live.py usa isso para medir o fps real e pular quadros repetidos."""
         with self._lock:
+            return self._frame, self._seq
+
+    def wait_new(self, last_seq, timeout=1.0):
+        """Bloqueia (sem gastar CPU) até chegar um quadro real novo. Devolve (quadro, contador)
+        ou (None, last_seq) se nada novo veio no prazo."""
+        with self._lock:
+            self._lock.wait_for(lambda: self._seq != last_seq and self._frame is not None, timeout)
+            if self._seq == last_seq or self._frame is None:
+                return None, last_seq
             return self._frame, self._seq
 
     def stop(self):
@@ -162,21 +172,28 @@ if __name__ == "__main__":
         sys.exit(1)
 
     out = sys.stdout.buffer
-    period, nxt, first = 1.0 / a.fps, time.perf_counter(), True
+    # Orientado a eventos: só envia quando o jogo entregou um quadro NOVO (antes repetia o último
+    # a taxa fixa: copiava ~1,5 MB por quadro pelo pipe sem necessidade). --fps vira o espaçamento
+    # mínimo entre envios, então um jogo a 144 fps não inunda o live.py.
+    period, last_seq, last_sent, first = 1.0 / a.fps, -1, 0.0, True
     try:
         while True:
-            nxt += period
-            time.sleep(max(0.0, nxt - time.perf_counter()))
-            f, seq = cap.latest_with_seq()        # taxa constante: repete o último quadro
+            f, seq = cap.wait_new(last_seq, 1.0)
             if f is None:
                 continue
+            wait = last_sent + 0.9 * period - time.perf_counter()
+            if wait > 0:
+                time.sleep(wait)
+                f, seq = cap.latest_with_seq()      # pega o mais novo depois da espera
+            last_seq = seq
             if first:
                 first = False
                 print(f"Primeiro quadro: {f.shape[1]}x{f.shape[0]}, brilho médio {f.mean():.1f}"
                       " (0 = preto)", file=sys.stderr)
             out.write(struct.pack("<IIQ", f.shape[1], f.shape[0], seq))
-            out.write(f.tobytes())
+            out.write(memoryview(f))                  # sem tobytes(): não copia de novo
             out.flush()
+            last_sent = time.perf_counter()
     except (BrokenPipeError, KeyboardInterrupt):
         pass
     finally:

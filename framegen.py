@@ -166,6 +166,25 @@ def interpolate(a, b, t, flow_fw=None, flow_bw=None, occ_thresh=18.0, scale=0.5)
     return out, mask
 
 
+class GenRef:
+    """Quadro gerado "pendente": guarda só as referências (quadros e fluxos). No overlay, a GPU
+    monta a imagem com o shader de interpolação (zero CPU de warp/mistura). render() é o caminho
+    de reserva na CPU, usado se o shader não estiver disponível."""
+    __slots__ = ("prev", "cur", "fw", "bw", "t", "shape")
+
+    def __init__(self, prev, cur, fw, bw, t):
+        self.prev, self.cur, self.fw, self.bw, self.t = prev, cur, fw, bw, t
+        self.shape = cur.shape
+
+    def render(self):
+        h, w = self.cur.shape[:2]
+        fw, bw = self.fw, self.bw
+        if fw.shape[:2] != (h, w):                 # fluxo pequeno (feito para a GPU): amplia
+            fw = cv2.resize(fw, (w, h), interpolation=cv2.INTER_LINEAR)
+            bw = cv2.resize(bw, (w, h), interpolation=cv2.INTER_LINEAR)
+        return interpolate(self.prev, self.cur, self.t, fw, bw)[0]
+
+
 def generate_between(a, b, n_new, **kw):
     """Gera n_new quadros igualmente espaçados entre a e b."""
     flow_fw = estimate_flow(a, b, kw.get("scale", 0.5))

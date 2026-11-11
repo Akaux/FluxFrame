@@ -60,7 +60,7 @@ import cv2
 import numpy as np
 
 from bench import Bench
-from framegen import (FLOW_METHODS, flow_from_gray, interpolate, set_flow_method,
+from framegen import (FLOW_METHODS, GenRef, flow_from_gray, interpolate, set_flow_method,
                       small_gray)
 
 WIN = "framegen"
@@ -71,6 +71,8 @@ def letterbox(img, w, h):
     ih, iw = img.shape[:2]
     if (iw, ih) == (w, h):
         return img
+    if abs((iw / ih) / (w / h) - 1.0) < 0.03:      # proporção igual (ex.: 960x541 x 960x540): só reescala
+        return cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA if w < iw else cv2.INTER_LINEAR)
     s = min(w / iw, h / ih)
     nw, nh = max(1, int(iw * s)), max(1, int(ih * s))
     r = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
@@ -195,7 +197,7 @@ class Source(threading.Thread):
             try:
                 while not self.ended:
                     w, h, seq = struct.unpack("<IIQ", read_exact(16))
-                    f = np.frombuffer(read_exact(w * h * 3), np.uint8).reshape(h, w, 3).copy()
+                    f = np.frombuffer(read_exact(w * h * 3), np.uint8).reshape(h, w, 3)   # só leitura, sem cópia
                     self._publish(f, seq)
             finally:
                 proc.terminate()
@@ -273,22 +275,31 @@ class GlobalHotkeys:
         print("Atalhos globais: Ctrl+Alt+F (FG), Ctrl+Alt+H (HUD), Ctrl+Alt+N (sair).")
 
         warned_no_device = False
+        ignored = set()          # dispositivos que não são teclado: nunca mais reabertos
+        last_scan = -1e9
         try:
             while not self.stop_event.is_set():
-                # Detecta teclados conectados depois da inicialização também.
-                for path in evdev.list_devices():
-                    if path in devices:
-                        continue
-                    try:
-                        dev = evdev.InputDevice(path)
-                        keys = dev.capabilities().get(ecodes.EV_KEY, [])
-                        if not (ctrl_codes | alt_codes | set(action_codes)).intersection(keys):
-                            dev.close()
+                # Reprocura teclados (hotplug) no máximo a cada 3 s (1 s se ainda não achou nenhum).
+                # Antes isso rodava a cada tecla apertada: abria/fechava todo /dev/input em pleno jogo.
+                now = time.monotonic()
+                if now - last_scan >= (3.0 if devices else 1.0):
+                    last_scan = now
+                    for path in evdev.list_devices():
+                        if path in devices or path in ignored:
                             continue
-                        devices[path] = dev
-                        pressed[path] = set()
-                    except (PermissionError, OSError):
-                        continue
+                        try:
+                            dev = evdev.InputDevice(path)
+                            keys = set(dev.capabilities().get(ecodes.EV_KEY, []))
+                            if not ({ecodes.KEY_LEFTCTRL, ecodes.KEY_LEFTALT,
+                                     ecodes.KEY_F, ecodes.KEY_H, ecodes.KEY_N} <= keys):
+                                dev.close()
+                                ignored.add(path)
+                                continue
+                            devices[path] = dev
+                            pressed[path] = set()
+                        except (PermissionError, OSError):
+                            ignored.add(path)
+                            continue
 
                 if not devices:
                     if not warned_no_device:
@@ -362,9 +373,11 @@ def main():
     p.add_argument("--geometry", help="overlay: x,y,largura,altura (padrão: monitor inteiro)")
     p.add_argument("--sharpness", type=float, default=0.2,
                    help="overlay: nitidez RCAS (0 = máxima, 2 = suave, negativo desliga)")
-    p.add_argument("--fit", choices=("fit", "stretch", "crop"), default="fit",
-                   help="overlay: fit = mantém a proporção (barras pretas se diferir do monitor); "
-                        "stretch = preenche a tela deformando; crop = preenche cortando as bordas")
+    p.add_argument("--fit", choices=("auto", "fit", "stretch", "crop"), default="auto",
+                   help="overlay: auto = preenche a tela quando a proporção é quase a mesma "
+                        "(diferença < 6%%) e mantém a proporção quando difere muito; "
+                        "fit = sempre mantém a proporção (barras pretas); "
+                        "stretch = preenche deformando; crop = preenche cortando as bordas")
     p.add_argument("--soft", action="store_true", help="overlay sem OpenGL (QPainter, mais lento)")
     p.add_argument("--managed", action="store_true",
                    help="overlay como janela normal (sem override-redirect), se o seu WM reclamar")
@@ -374,9 +387,18 @@ def main():
     p.add_argument("--flow", choices=FLOW_METHODS, default=None,
                    help="estimador de movimento (padrão farneback = melhor qualidade; "
                         "dis-* é bem mais rápido, com qualidade menor)")
-    p.add_argument("--cv-threads", type=int, default=0,
-                   help="limita as threads do OpenCV (0 = padrão). Menos threads deixam CPU "
+    p.add_argument("--cv-threads", type=int, default=2,
+                   help="threads do OpenCV (padrão 2; 0 = todas). Menos threads deixam CPU "
                         "para o jogo e estabilizam o fps dele")
+    p.add_argument("--nice", type=int, default=5,
+                   help="prioridade do framegen e da captura (0..19; maior = cede mais CPU ao "
+                        "jogo). Padrão 5")
+    p.add_argument("--single-flow", action="store_true",
+                   help="calcula só o fluxo A->B e deriva o inverso (metade do custo do fluxo; "
+                        "um pouco mais de artefato nas bordas de objetos)")
+    p.add_argument("--cpu-interp", action="store_true",
+                   help="overlay: força a interpolação na CPU (por padrão o warp/mistura roda "
+                        "na GPU, que zera esse custo de CPU)")
     p.add_argument("--bench-log", metavar="ARQ.csv",
                    help="grava uma linha por segundo (fps do jogo, saída, 1%% low...)")
     args = p.parse_args()
@@ -386,6 +408,11 @@ def main():
         set_flow_method(args.flow)
     if args.cv_threads > 0:
         cv2.setNumThreads(args.cv_threads)
+    if args.nice > 0:
+        try:
+            os.nice(args.nice)           # a captura (processo filho) herda a prioridade
+        except OSError:
+            pass
     if args.overlay and (args.headless or args.x11):
         p.error("--overlay não combina com --headless nem --x11")
     if args.headless and not args.seconds:
@@ -407,7 +434,10 @@ def main():
     qscale = [args.scale]
     proc_ms = collections.deque(maxlen=60)
     st = dict(late=0, skipped=0, stale=0, errors=0, shown=0, dup=0)
-    pool = ThreadPoolExecutor(2)
+    # [True] = o overlay monta os quadros gerados na GPU. O overlay põe False se o shader falhar,
+    # e o processor volta sozinho para a CPU.
+    gpu_interp = [bool(args.overlay and not args.soft and not args.cpu_interp)]
+    pool = ThreadPoolExecutor(1 if args.single_flow else 2)
     q = queue.Queue()                             # fila de saída: (hora_de_exibir, quadro, fg)
     stop = threading.Event()
     start = time.perf_counter()
@@ -474,17 +504,26 @@ def main():
                     if pg is None or pg[1] != sc:
                         pg = (small_gray(prev, sc), sc)
                     gc = small_gray(cur, sc)
-                    size = (cur.shape[1], cur.shape[0])
+                    use_gpu = gpu_interp[0]
+                    # GPU: o fluxo fica pequeno (a GPU amostra com filtro bilinear). CPU: tela cheia.
+                    size = None if use_gpu else (cur.shape[1], cur.shape[0])
                     f_fw = pool.submit(flow_from_gray, pg[0], gc, sc, size)
-                    f_bw = pool.submit(flow_from_gray, gc, pg[0], sc, size)
-                    fw, bw = f_fw.result(), f_bw.result()
+                    if args.single_flow:
+                        fw = f_fw.result()
+                        bw = -fw                           # fluxo inverso ~ negativo do direto
+                    else:
+                        f_bw = pool.submit(flow_from_gray, gc, pg[0], sc, size)
+                        fw, bw = f_fw.result(), f_bw.result()
                     for k in range(1, n):
                         when = prev_t + L + k * gap / n
                         if time.perf_counter() > when + 0.002:
                             st["skipped"] += 1             # já passou da hora: não adianta gerar
                             continue
-                        mid, _ = interpolate(prev, cur, k / n, fw, bw, scale=sc)
-                        q.put((when, mid, True))
+                        if use_gpu:                        # só referências: a GPU faz warp+mistura
+                            q.put((when, GenRef(prev, cur, fw, bw, k / n), True))
+                        else:
+                            mid, _ = interpolate(prev, cur, k / n, fw, bw, scale=sc)
+                            q.put((when, mid, True))
                     pg = (gc, sc)
                     proc_ms.append((time.perf_counter() - t0) * 1000)
                 except Exception as e:
@@ -630,7 +669,7 @@ def main():
             run_overlay(q, src.size, st, bench.present, hud_lines, hud_on, toggle_fg,
                         output=args.output, geometry=args.geometry, soft=args.soft,
                         managed=args.managed, sharpness=args.sharpness, seconds=args.seconds,
-                        fit=args.fit)
+                        fit=args.fit, gpu_interp=gpu_interp)
         else:
             window_loop()
     except KeyboardInterrupt:

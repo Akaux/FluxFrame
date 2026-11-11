@@ -32,8 +32,14 @@ import time
 os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
 os.environ["QT_QPA_PLATFORM"] = "xcb"          # XWayland no Wayland; X11 nativo no X11
 os.environ.setdefault("PYOPENGL_PLATFORM", "glx")
+# KDE Plasma + escala fracionária (125%, 150%...): com o HiDPI do Qt ligado, a geometria vira
+# "lógica" e o arredondamento pode deixar o overlay 1-2 px menor que a tela (ou do tamanho
+# errado). Desligado, 1 unidade do Qt = 1 pixel do XWayland e a janela cobre o monitor inteiro.
+os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "0"
+os.environ.pop("QT_SCALE_FACTOR", None)
 
 import numpy as np
+from framegen import GenRef
 from PySide6.QtCore import QRect, Qt, QTimer
 from PySide6.QtGui import (QColor, QFont, QGuiApplication, QImage, QPainter,
                            QRasterWindow, QSurfaceFormat)
@@ -133,6 +139,44 @@ void main() {
 """
 
 
+# Interpolação na GPU (equivale a framegen.interpolate): warp dos dois quadros pelo fluxo, mistura
+# e, onde os warps discordam (oclusão), usa só o quadro temporalmente mais próximo.
+# Renderiza em textura com a MESMA convenção das imagens (linha 0 = topo): usa gl_FragCoord.
+INTERP_FRAG = """#version 330 core
+out vec4 fragColor;
+uniform sampler2D texA;      // quadro anterior (filtro linear)
+uniform sampler2D texB;      // quadro seguinte
+uniform sampler2D flowF;     // fluxo A->B em pixels do quadro (baixa resolução, bilinear)
+uniform sampler2D flowB;     // fluxo B->A
+uniform vec2  size;
+uniform float t;
+const float OCC = 18.0 / 255.0;
+
+void warps(vec2 p, out vec3 wa, out vec3 wb) {
+    vec2 uv = p / size;
+    wa = texture(texA, (p - t * texture(flowF, uv).rg) / size).rgb;
+    wb = texture(texB, (p - (1.0 - t) * texture(flowB, uv).rg) / size).rgb;
+}
+float diffAt(vec2 p) {
+    vec3 a, b;
+    warps(p, a, b);
+    return dot(abs(a - b), vec3(1.0 / 3.0));
+}
+void main() {
+    vec2 p = gl_FragCoord.xy;
+    vec3 wa, wb;
+    warps(p, wa, wb);
+    // diferença média numa vizinhança pequena (a versão CPU usa 1/4 da resolução + blur)
+    float d = 0.4 * dot(abs(wa - wb), vec3(1.0 / 3.0))
+            + 0.15 * (diffAt(p + vec2(3.0, 0.0)) + diffAt(p - vec2(3.0, 0.0))
+                    + diffAt(p + vec2(0.0, 3.0)) + diffAt(p - vec2(0.0, 3.0)));
+    float occ = clamp((d - OCC) / OCC, 0.0, 1.0);
+    vec3 nearest = t < 0.5 ? wa : wb;
+    fragColor = vec4(mix(mix(wa, wb, t), nearest, occ), 1.0);
+}
+"""
+
+
 # --------------------------------------------------------------- fila / prazo
 class Feed:
     """Recebe (hora_de_exibir, quadro, fg_on) do agendador e escolhe o quadro de cada vsync.
@@ -145,8 +189,9 @@ class Feed:
         self.period = 1.0 / refresh
         self.lead = 0.5 * self.period          # um quadro que vence antes do próximo vsync já serve
         self.buf = collections.deque()
-        self.cur = None                        # (quadro, fg_on)
-        self.new = False                       # há quadro novo para subir à GPU
+        self.cur = None                        # (quadro ou GenRef, fg_on)
+        self.new = False
+        self._hud_t, self._hud_lines, self._hud_fg = -1e9, None, None
 
     def drain(self):
         try:
@@ -157,6 +202,11 @@ class Feed:
         while len(self.buf) > self.MAX_BUF:    # janela parada? não deixa a memória crescer
             self.buf.popleft()
             self.st["stale"] += 1
+
+    def due(self, now):
+        """Há quadro vencendo antes do próximo vsync? (decide se vale repintar)"""
+        self.drain()
+        return bool(self.buf) and self.buf[0][0] <= now + self.lead
 
     def advance(self):
         self.drain()
@@ -178,19 +228,24 @@ class Feed:
     def hud(self, now):
         if not self.hud_on[0] or self.cur is None:
             return None
-        return self.hud_lines(now, self.cur[1])
+        if now - self._hud_t >= 0.25 or self._hud_fg != self.cur[1]:    # texto a 4 Hz basta
+            self._hud_lines, self._hud_t, self._hud_fg = self.hud_lines(now, self.cur[1]), now, self.cur[1]
+        return self._hud_lines
 
 
-FIT_MODE = "fit"      # "fit" = barras pretas | "stretch" = preenche (deforma) | "crop" = preenche (corta)
+FIT_MODE = "auto"     # "auto" = preenche se a proporção bate, senão barras | "fit" | "stretch" | "crop"
 
 
 def _fit(w, h, W, H):
     """Retângulo (x, y, largura, altura) onde a imagem w x h é desenhada na janela W x H.
     fit: mantém a proporção (barras pretas); stretch: ocupa tudo, deformando se as proporções
     diferem; crop: ocupa tudo mantendo a proporção, cortando o que passa das bordas."""
-    if FIT_MODE == "stretch":
+    mode = FIT_MODE
+    if mode == "auto":      # quase a mesma proporção (< 6%): preenche a tela, sem faixas finas
+        mode = "stretch" if abs((w / h) / (W / H) - 1.0) < 0.06 else "fit"
+    if mode == "stretch":
         return 0, 0, W, H
-    s = max(W / w, H / h) if FIT_MODE == "crop" else min(W / w, H / h)
+    s = max(W / w, H / h) if mode == "crop" else min(W / w, H / h)
     vw, vh = max(1, int(w * s)), max(1, int(h * s))
     return (W - vw) // 2, (H - vh) // 2, vw, vh
 
@@ -208,6 +263,9 @@ def _draw_hud(p, lines):
 
 def _paint_qt(p, frame, W, H):
     """Caminho sem shader: QPainter com filtro suave (fallback)."""
+    if isinstance(frame, GenRef):
+        frame = frame.render()                 # sem GPU: monta o quadro na CPU
+    frame = np.ascontiguousarray(frame)
     h, w = frame.shape[:2]
     img = QImage(frame.data, w, h, w * 3, QImage.Format.Format_BGR888)
     x, y, vw, vh = _fit(w, h, W, H)
@@ -269,19 +327,45 @@ def keep_click_through(view):
     return ok[0]
 
 
+def keep_geometry(view, rect):
+    """Reaplica a geometria se o compositor/WM a alterar (o overlay tem que cobrir o monitor)."""
+    def tick():
+        if view.geometry() != rect:
+            print(f"overlay: geometria mudou para {view.geometry().width()}x"
+                  f"{view.geometry().height()}; restaurando {rect.width()}x{rect.height()}")
+            view.setGeometry(rect)
+    timer = QTimer(view)
+    timer.timeout.connect(tick)
+    timer.start(1500)
+    view._geom_timer = timer
+
+
 # ------------------------------------------------------------------ janelas
 class GLView(QOpenGLWindow):
-    def __init__(self, feed, rcas):
+    def __init__(self, feed, rcas, gpu_flag):
         super().__init__()
         self.feed, self.rcas = feed, rcas
+        self.gpu_flag = gpu_flag               # [bool] compartilhado com o processor do live.py
         self.gl_ok = True
-        self.tex = self.tex_size = None
+        self.interp_ok = False
+        self.frames = collections.OrderedDict()    # id(array) -> (array, textura)
+        self.flows = collections.OrderedDict()
+        self.fbo = self.fbo_tex = self.fbo_size = None
         self.last = 0.0
-        watchdog = QTimer(self)                 # garante progresso se o vsync parar
-        watchdog.timeout.connect(self.update)
-        watchdog.start(250)
-        self._watchdog = watchdog
+        # Só repinta quando há quadro vencendo (ou a cada 250 ms para o HUD). Antes repintava a
+        # cada vsync (144 Hz = 144 rodadas de chamadas PyOpenGL por segundo, mesmo sem novidade).
+        tick = QTimer(self)
+        tick.setTimerType(Qt.TimerType.PreciseTimer)
+        tick.timeout.connect(self._pump)
+        tick.start(3)
+        self._tick = tick
 
+    def _pump(self):
+        now = time.perf_counter()
+        if self.feed.due(now) or now - self.last >= 0.25:
+            self.update()
+
+    # ---------------------------------------------------------------- init
     def initializeGL(self):
         try:
             from OpenGL import GL
@@ -292,13 +376,6 @@ class GLView(QOpenGLWindow):
                 shaders.compileShader(FRAG, GL.GL_FRAGMENT_SHADER),
                 validate=False)                 # validar sem VAO falha no core profile
             self.vao = GL.glGenVertexArrays(1)
-            self.tex = GL.glGenTextures(1)
-            GL.glBindTexture(GL.GL_TEXTURE_2D, self.tex)
-            for k, v in ((GL.GL_TEXTURE_MIN_FILTER, GL.GL_NEAREST),
-                         (GL.GL_TEXTURE_MAG_FILTER, GL.GL_NEAREST),
-                         (GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE),
-                         (GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)):
-                GL.glTexParameteri(GL.GL_TEXTURE_2D, k, v)
             self.loc = {n: GL.glGetUniformLocation(self.prog, n)
                         for n in ("tex", "srcSize", "dstSize", "rcas")}
             print(f"overlay: GL {GL.glGetString(GL.GL_VERSION).decode()} | "
@@ -306,23 +383,122 @@ class GLView(QOpenGLWindow):
         except Exception as e:
             print(f"overlay: OpenGL indisponível ({e}); usando QPainter (mais lento).")
             self.gl_ok = False
+            self.gpu_flag[0] = False
+            return
+        if not self.gpu_flag[0]:
+            return
+        try:
+            self.iprog = shaders.compileProgram(
+                shaders.compileShader(VERT, GL.GL_VERTEX_SHADER),
+                shaders.compileShader(INTERP_FRAG, GL.GL_FRAGMENT_SHADER),
+                validate=False)
+            self.iloc = {n: GL.glGetUniformLocation(self.iprog, n)
+                         for n in ("texA", "texB", "flowF", "flowB", "size", "t")}
+            self.fbo = GL.glGenFramebuffers(1)
+            self.interp_ok = True
+            print("overlay: interpolação na GPU ativa (warp/mistura sem uso de CPU).")
+        except Exception as e:
+            print(f"overlay: shader de interpolação indisponível ({e}); interpolando na CPU.")
+            self.gpu_flag[0] = False
 
-    def _upload(self, frame):
+    # ------------------------------------------------------------ texturas
+    def _tex_params(self, GL, filt):
+        for k, v in ((GL.GL_TEXTURE_MIN_FILTER, filt), (GL.GL_TEXTURE_MAG_FILTER, filt),
+                     (GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE),
+                     (GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)):
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, k, v)
+
+    def _cached(self, cache, arr, limit, make):
+        """Textura de `arr`, enviada uma única vez (a chave é a identidade do array, que o cache
+        mantém vivo, então o id não é reaproveitado)."""
+        key = id(arr)
+        hit = cache.get(key)
+        if hit is not None:
+            cache.move_to_end(key)
+            return hit[1]
+        tex = make(arr)
+        cache[key] = (arr, tex)
+        while len(cache) > limit:
+            _, (_, old) = cache.popitem(last=False)
+            self.GL.glDeleteTextures([old])
+        return tex
+
+    def _make_frame_tex(self, arr):
         GL = self.GL
-        h, w = frame.shape[:2]
+        h, w = arr.shape[:2]
+        tex = GL.glGenTextures(1)
         GL.glActiveTexture(GL.GL_TEXTURE0)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self.tex)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
+        self._tex_params(GL, GL.GL_LINEAR)      # linear: o shader de interpolação usa texture()
         GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
-        frame = np.ascontiguousarray(frame)
-        if self.tex_size != (w, h):
-            GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGB8, w, h, 0,
-                            GL.GL_BGR, GL.GL_UNSIGNED_BYTE, frame)
-            self.tex_size = (w, h)
-        else:
-            GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, w, h,
-                               GL.GL_BGR, GL.GL_UNSIGNED_BYTE, frame)
+        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGB8, w, h, 0, GL.GL_BGR,
+                        GL.GL_UNSIGNED_BYTE, np.ascontiguousarray(arr))
+        return tex
 
+    def _make_flow_tex(self, arr):
+        GL = self.GL
+        h, w = arr.shape[:2]
+        tex = GL.glGenTextures(1)
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
+        self._tex_params(GL, GL.GL_LINEAR)
+        GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RG16F, w, h, 0, GL.GL_RG, GL.GL_FLOAT,
+                        np.ascontiguousarray(arr, dtype=np.float32))
+        return tex
+
+    def _frame_tex(self, arr):
+        return self._cached(self.frames, arr, 6, self._make_frame_tex)
+
+    def _flow_tex(self, arr):
+        return self._cached(self.flows, arr, 6, self._make_flow_tex)
+
+    def _ensure_fbo(self, w, h):
+        GL = self.GL
+        if self.fbo_size == (w, h):
+            return
+        if self.fbo_tex is not None:
+            GL.glDeleteTextures([self.fbo_tex])
+        self.fbo_tex = GL.glGenTextures(1)
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self.fbo_tex)
+        self._tex_params(GL, GL.GL_NEAREST)
+        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA8, w, h, 0, GL.GL_RGBA,
+                        GL.GL_UNSIGNED_BYTE, None)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.fbo)
+        GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER, GL.GL_COLOR_ATTACHMENT0,
+                                  GL.GL_TEXTURE_2D, self.fbo_tex, 0)
+        if GL.glCheckFramebufferStatus(GL.GL_FRAMEBUFFER) != GL.GL_FRAMEBUFFER_COMPLETE:
+            raise RuntimeError("framebuffer incompleto")
+        self.fbo_size = (w, h)
+
+    def _interp(self, g):
+        """Passo 1: monta o quadro gerado numa textura (tamanho do quadro de origem)."""
+        GL = self.GL
+        h, w = g.cur.shape[:2]
+        self._ensure_fbo(w, h)
+        texs = (self._frame_tex(g.prev), self._frame_tex(g.cur),
+                self._flow_tex(g.fw), self._flow_tex(g.bw))
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.fbo)
+        GL.glViewport(0, 0, w, h)
+        GL.glUseProgram(self.iprog)
+        for unit, (tex, name) in enumerate(zip(texs, ("texA", "texB", "flowF", "flowB"))):
+            GL.glActiveTexture(GL.GL_TEXTURE0 + unit)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
+            GL.glUniform1i(self.iloc[name], unit)
+        GL.glUniform2f(self.iloc["size"], float(w), float(h))
+        GL.glUniform1f(self.iloc["t"], float(g.t))
+        GL.glBindVertexArray(self.vao)
+        GL.glDrawArrays(GL.GL_TRIANGLES, 0, 3)
+        GL.glBindVertexArray(0)
+        GL.glUseProgram(0)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.defaultFramebufferObject())
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        return self.fbo_tex
+
+    # --------------------------------------------------------------- pintura
     def paintGL(self):
+        self.last = time.perf_counter()
         feed = self.feed
         now = feed.advance()
         dpr = self.devicePixelRatio()
@@ -333,6 +509,7 @@ class GLView(QOpenGLWindow):
             except Exception as e:
                 print(f"overlay: erro no OpenGL ({e}); passando para QPainter.")
                 self.gl_ok = False
+                self.gpu_flag[0] = False
         lines = feed.hud(now)
         if feed.cur is not None and not self.gl_ok:
             p = QPainter(self)
@@ -346,27 +523,35 @@ class GLView(QOpenGLWindow):
             _draw_hud(p, lines)
             p.end()
         feed.new = False
-        # proteção: se o vsync não bloquear, não gira a 100% de CPU disputando o GIL
-        dt = time.perf_counter() - self.last
-        if dt < 0.5 * feed.period:
-            time.sleep(0.5 * feed.period - dt)
-        self.last = time.perf_counter()
-        self.update()                           # próximo vsync
 
     def _draw_gl(self, feed, W, H):
         GL = self.GL
         frame = feed.cur[0]
-        h, w = frame.shape[:2]
+        tex = None
+        if isinstance(frame, GenRef):
+            h, w = frame.shape[:2]
+            if self.interp_ok:
+                try:
+                    tex = self._interp(frame)
+                except Exception as e:
+                    print(f"overlay: interpolação na GPU falhou ({e}); voltando para a CPU.")
+                    self.interp_ok = False
+                    self.gpu_flag[0] = False
+                    GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.defaultFramebufferObject())
+                    GL.glUseProgram(0)
+            if tex is None:
+                frame = frame.render()          # reserva na CPU
+        if tex is None:
+            tex = self._frame_tex(frame)
+            h, w = frame.shape[:2]
         GL.glViewport(0, 0, W, H)
         GL.glClearColor(0, 0, 0, 1)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
-        if feed.new or self.tex_size is None:
-            self._upload(frame)
         x, y, vw, vh = _fit(w, h, W, H)
         GL.glViewport(x, y, vw, vh)
         GL.glUseProgram(self.prog)
         GL.glActiveTexture(GL.GL_TEXTURE0)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self.tex)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
         GL.glUniform1i(self.loc["tex"], 0)
         GL.glUniform2f(self.loc["srcSize"], float(w), float(h))
         GL.glUniform2f(self.loc["dstSize"], float(vw), float(vh))
@@ -405,7 +590,8 @@ class SoftView(QRasterWindow):
 
 # --------------------------------------------------------------------- main
 def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geometry=None,
-                soft=False, managed=False, sharpness=0.2, seconds=0, fit="fit"):
+                soft=False, managed=False, sharpness=0.2, seconds=0, fit="auto",
+                gpu_interp=None):
     """Abre o overlay e bloqueia até sair. `q` é a fila (hora, quadro, fg) do live.py."""
     global FIT_MODE
     FIT_MODE = fit
@@ -426,9 +612,12 @@ def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geo
         g = scr.geometry()
         x, y, w, h = g.x(), g.y(), g.width(), g.height()
 
+    gpu = gpu_interp if gpu_interp is not None else [False]
+    if soft:
+        gpu[0] = False
     feed = Feed(q, st, present, hud_lines, hud_on, refresh)
     view = SoftView(feed, refresh) if soft else GLView(
-        feed, 0.0 if sharpness < 0 else 2.0 ** -sharpness)
+        feed, 0.0 if sharpness < 0 else 2.0 ** -sharpness, gpu)
     view.setTitle("framegen-overlay")
     view.setScreen(scr)
     flags = (Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
@@ -443,9 +632,11 @@ def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geo
     view.setGeometry(x, y, w, h)
     # Entrada atravessa a janela: região de input vazia + foco nunca vai para o overlay.
     keep_click_through(view)
+    keep_geometry(view, QRect(x, y, w, h))
     app.focusWindowChanged.connect(
         lambda win: print("overlay: AVISO: o overlay recebeu foco") if win is view else None)
-    print(f"overlay: {w}x{h}+{x}+{y} @ {refresh:.0f} Hz | origem {size[0]}x{size[1]} | "
+    print(f"overlay: {w}x{h}+{x}+{y} @ {refresh:.0f} Hz (dpr {scr.devicePixelRatio():g}) | "
+          f"origem {size[0]}x{size[1]} | fit {fit} | "
           f"{'QPainter' if soft else 'GL + FSR-like'} | "
           "SIGUSR1 = FG on/off, SIGUSR2 = HUD, Ctrl+C no terminal = sair")
 
