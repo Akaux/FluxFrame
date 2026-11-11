@@ -14,18 +14,18 @@ from pathlib import Path
 from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtGui import QColor, QIcon, QPalette
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFrame,
-                               QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout, QWidget)
+                               QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout, QWidget, QRadioButton)
 
 APP_DIR = Path(__file__).resolve().parent
 CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "framegen-gui"
 LOG = CACHE / "ultima-execucao.log"
-TARGETS = (30, 45, 60, 75, 90, 120, 144, 165, 240, 0)    # 0 = ilimitado; padrão 60
+TARGETS = (30, 45, 60, 75, 90, 120, 144, 165, 240, 0)    # 0 = ilimitado
 START_MARKERS = ("Primeiro quadro", "SAIDA", "FG ON")     # linhas que o live.py imprime ao rodar
 
 
 # ------------------------------------------------------------------ lógica
 def build_args(cfg):
-    """Opções do live.py para a configuração do painel."""
+    """Opções do live.py para a configuração do painel (compatível com o script original)."""
     args = ["--screen", "--overlay", "--mult", str(cfg["mult"]),
             "--width", str(cfg["width"]), "--output", str(cfg["monitor"]),
             "--fit", cfg["fit"]]
@@ -225,7 +225,7 @@ class Panel(QWidget):
         root.addLayout(head)
 
         # Multiplicador
-        self.box = QWidget()                      # tudo que trava enquanto roda
+        self.box = QWidget()
         bl = QVBoxLayout(self.box)
         bl.setContentsMargins(0, 0, 0, 0)
         bl.setSpacing(14)
@@ -244,7 +244,32 @@ class Panel(QWidget):
         cl.addWidget(self.slider)
         bl.addWidget(card)
 
-        # FPS alvo
+        # Configuração visual FSR 4 / FSR 1
+        card_fsr = QFrame(); card_fsr.setObjectName("card")
+        cf_l = QVBoxLayout(card_fsr); cf_l.setContentsMargins(16, 14, 16, 16); cf_l.setSpacing(10)
+        cf_l.addWidget(self._label("TECNOLOGIA FSR & ESCALA", "section"))
+        
+        fsr_row = QHBoxLayout()
+        self.rb_fsr1 = QRadioButton("FSR 1")
+        self.rb_fsr4 = QRadioButton("FSR 4")
+        self.rb_fsr1.setChecked(True)
+        self.rb_fsr1.toggled.connect(self._on_fsr_changed)
+        fsr_row.addWidget(self.rb_fsr1)
+        fsr_row.addWidget(self.rb_fsr4)
+        cf_l.addLayout(fsr_row)
+
+        scale_row = QHBoxLayout()
+        scale_row.addWidget(self._label("Fator FSR 4:"))
+        self.rb_scale1 = QRadioButton("1x (Nativo)")
+        self.rb_scale4 = QRadioButton("4x (Superamostragem)")
+        self.rb_scale1.setChecked(True)
+        scale_row.addWidget(self.rb_scale1)
+        scale_row.addWidget(self.rb_scale4)
+        cf_l.addLayout(scale_row)
+        bl.addWidget(card_fsr)
+        self._update_scale_availability()
+
+        # FPS alvo (Padrão alterado para Ilimitado / 0)
         card2 = QFrame(); card2.setObjectName("card")
         c2 = QVBoxLayout(card2); c2.setContentsMargins(16, 14, 16, 16); c2.setSpacing(10)
         c2.addWidget(self._label("FPS ALVO", "section"))
@@ -318,26 +343,54 @@ class Panel(QWidget):
         self.toggle.hide()
         root.addWidget(self.toggle, alignment=Qt.AlignmentFlag.AlignCenter)
 
+    def _on_fsr_changed(self):
+        self._update_scale_availability()
+
+    def _update_scale_availability(self):
+        is_fsr4 = self.rb_fsr4.isChecked()
+        self.rb_scale1.setEnabled(is_fsr4)
+        self.rb_scale4.setEnabled(is_fsr4)
+
     # ---------------------------------------------------------- estado
     def _cfg(self):
         target = int(self.cb_target.currentData() or 0)
+        fsr_mode = "fsr4" if self.rb_fsr4.isChecked() else "fsr1"
+        scale_factor = 4 if (fsr_mode == "fsr4" and self.rb_scale4.isChecked()) else 1
         return dict(mult=self.slider.value(), unlimited=target == 0, target=target,
                     capture_fps=int(self.cb_fps.currentData()),
                     width=int(self.cb_width.currentData()),
                     monitor=int(self.cb_mon.currentData() or 0),
-                    fit=str(self.cb_fit.currentData() or "stretch"))
+                    fit=str(self.cb_fit.currentData() or "stretch"),
+                    fsr_mode=fsr_mode, scale_factor=scale_factor)
 
     def _load(self):
         s = self.settings
         self.slider.setValue(s.value("mult", 2, type=int))
-        i = self.cb_target.findData(s.value("target", 60, type=int))
-        self.cb_target.setCurrentIndex(i if i >= 0 else self.cb_target.findData(60))
+        
+        # Altera o carregamento padrão para 0 (Ilimitado) caso não haja preferência salva
+        target_default = 0 if s.status() == QSettings.Status.AccessError else s.value("target", 0, type=int)
+        i = self.cb_target.findData(target_default)
+        self.cb_target.setCurrentIndex(i if i >= 0 else self.cb_target.findData(0))
+        
         for cb, key, default in ((self.cb_fps, "capture_fps", 30), (self.cb_width, "width", 960),
                                  (self.cb_mon, "monitor", 0)):
             i = cb.findData(s.value(key, default, type=int))
             cb.setCurrentIndex(i if i >= 0 else 0)
         i = self.cb_fit.findData(s.value("fit", "stretch", type=str))
         self.cb_fit.setCurrentIndex(i if i >= 0 else 0)
+        
+        fsr_mode = s.value("fsr_mode", "fsr1", type=str)
+        if fsr_mode == "fsr4":
+            self.rb_fsr4.setChecked(True)
+        else:
+            self.rb_fsr1.setChecked(True)
+            
+        scale_factor = s.value("scale_factor", 1, type=int)
+        if scale_factor == 4:
+            self.rb_scale4.setChecked(True)
+        else:
+            self.rb_scale1.setChecked(True)
+        self._update_scale_availability()
 
     def _save(self):
         c = self._cfg()
@@ -359,7 +412,7 @@ class Panel(QWidget):
             warn += f"\nSeu monitor tem {hz:.0f} Hz: acima disso o alvo não aparece na tela."
         self.info.setText(f"Captura {fmt(cap)} fps  →  saída {fmt(out)} fps  ·  latência ≈ {lat:.0f} ms{warn}")
         self.folder_lb.setText(f"Pasta: {self.folder}" if self.folder
-                               else "Pasta do framegen não encontrada (onde está o live.py).")
+                               else "Pasta do framegen não encontrada (onde está el live.py).")
         if self.phase == "idle" and not self.status.text():
             self._set_phase("idle")
         self.adjustSize()

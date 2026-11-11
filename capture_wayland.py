@@ -151,17 +151,13 @@ class PortalCapture:
 
 
 if __name__ == "__main__":
-    # Processo filho: fala com o portal e envia quadros BGR pelo stdout.
-    # Protocolo por quadro: '<IIQ' (largura, altura, contador de quadros reais do jogo)
-    # + largura*altura*3 bytes.
-    # Roda separado do visualizador para o GLib/GStreamer não conflitar com o Qt do OpenCV.
     import argparse
     import struct
     import time
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--width", type=int, default=960)
-    ap.add_argument("--fps", type=float, default=30.0)
+    ap.add_argument("--fps", type=float, default=0.0)
     ap.add_argument("--overlay", action="store_true", help="só janelas, cursor oculto")
     a = ap.parse_args()
     cap = PortalCapture(a.width, overlay=a.overlay)
@@ -172,19 +168,24 @@ if __name__ == "__main__":
         sys.exit(1)
 
     out = sys.stdout.buffer
-    # Orientado a eventos: só envia quando o jogo entregou um quadro NOVO (antes repetia o último
-    # a taxa fixa: copiava ~1,5 MB por quadro pelo pipe sem necessidade). --fps vira o espaçamento
-    # mínimo entre envios, então um jogo a 144 fps não inunda o live.py.
-    period, last_seq, last_sent, first = 1.0 / a.fps, -1, 0.0, True
+    
+    # Se FPS for menor ou igual a 0, desliga o limitador de tempo por software
+    disable_throttle = (a.fps <= 0 or a.fps >= 1000)
+    period = 1.0 / a.fps if not disable_throttle else 0.0
+    last_seq, last_sent, first = -1, 0.0, True
+    
     try:
         while True:
             f, seq = cap.wait_new(last_seq, 1.0)
             if f is None:
                 continue
-            wait = last_sent + 0.9 * period - time.perf_counter()
-            if wait > 0:
-                time.sleep(wait)
-                f, seq = cap.latest_with_seq()      # pega o mais novo depois da espera
+            
+            if not disable_throttle:
+                wait = last_sent + 0.9 * period - time.perf_counter()
+                if wait > 0:
+                    time.sleep(wait)
+                    f, seq = cap.latest_with_seq()      # pega o mais novo depois da espera
+            
             last_seq = seq
             if first:
                 first = False
