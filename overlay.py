@@ -1,3 +1,6 @@
+"""
+Overlay "máscara" do framegen otimizado.
+"""
 import collections
 import os
 import queue
@@ -12,7 +15,7 @@ os.environ.pop("QT_SCALE_FACTOR", None)
 
 import numpy as np
 from framegen import GenRef
-from PySide6.QtCore import QRect, Qt, QTimer, QEvent
+from PySide6.QtCore import QEvent, QPoint, QRect, Qt, QTimer
 from PySide6.QtGui import (QColor, QFont, QGuiApplication, QImage, QPainter,
                            QRasterWindow, QSurfaceFormat)
 from PySide6.QtOpenGL import QOpenGLWindow
@@ -134,7 +137,6 @@ void main() {
 }
 """
 
-
 class Feed:
     MAX_BUF = 24
 
@@ -191,9 +193,10 @@ FIT_MODE = "auto"
 
 
 def _fit(w, h, W, H):
+    global FIT_MODE
     mode = FIT_MODE
     if mode == "auto":
-        mode = "stretch" if abs((w / h) / (W / H) - 1.0) < 0.06 else "fit"
+        return 0, 0, W, H
     if mode == "stretch":
         return 0, 0, W, H
     s = max(W / w, H / h) if mode == "crop" else min(W / w, H / h)
@@ -261,10 +264,11 @@ class GLView(QOpenGLWindow):
         self.flows = collections.OrderedDict()
         self.fbo = self.fbo_tex = self.fbo_size = None
         self.last = 0.0
+        
         tick = QTimer(self)
         tick.setTimerType(Qt.TimerType.PreciseTimer)
         tick.timeout.connect(self._pump)
-        tick.start(1)  # Intervalo otimizado para destravar e atualizar o contador de quadros livremente
+        tick.start(1)
         self._tick = tick
 
     def _pump(self):
@@ -452,37 +456,49 @@ class GLView(QOpenGLWindow):
         GL.glBindVertexArray(0)
         GL.glUseProgram(0)
 
-    # Tratamento inteligente de Minimizar / Alt+Tab / Foco para ocultar e manter rodando em background
     def changeEvent(self, event):
-        if event.type() == QEvent.Type.WindowStateChange or event.type() == QEvent.Type.ActivationChange:
-            if self.windowState() & Qt.WindowState.WindowMinimized or not self.isActiveWindow():
-                # Oculta discretamente o overlay para liberar a tela quando o usuário minimizar ou alternar via Alt+Tab
-                self.hide()
-            else:
-                self.show()
+        if event.type() == QEvent.Type.ActivationChange:
+            if not self.isActiveWindow():
+                QGuiApplication.quit()           # (quitOnLastWindowClosed está desligado)
         super().changeEvent(event)
 
 
 def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geometry=None,
                 soft=False, managed=False, sharpness=0.2, seconds=0, fit="auto",
-                gpu_interp=None):
+                gpu_interp=None, tracker=None):
+    """`tracker` (winfind.WindowTracker) faz o overlay assumir a posição e o tamanho da janela do
+    app e segui-la; sem ele (ou se o app não for achado) cobre `geometry` ou o monitor inteiro."""
     global FIT_MODE
     FIT_MODE = fit
     fmt = QSurfaceFormat()
     fmt.setVersion(3, 3)
     fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
-    fmt.setSwapInterval(0)  # Desativa o VSync interno do overlay para destravar o FPS gerado na tela
+    fmt.setSwapInterval(0)
     QSurfaceFormat.setDefaultFormat(fmt)
 
     app = QGuiApplication(["framegen-overlay"])
+    app.setQuitOnLastWindowClosed(False)   # esconder o overlay (app minimizado) não pode encerrar
     screens = app.screens()
     scr = screens[min(max(output, 0), len(screens) - 1)]
-    refresh = scr.refreshRate() or 60.0
-    if geometry:
+    track_geo = None
+    if tracker is not None:
+        try:
+            track_geo = tracker.poll(time.perf_counter())
+        except Exception as e:
+            print(f"overlay: acompanhamento da janela indisponível ({e})")
+            tracker = None
+    if track_geo:
+        x, y, w, h = track_geo
+        scr = app.screenAt(QPoint(x + w // 2, y + h // 2)) or scr
+    elif geometry:
         x, y, w, h = (int(v) for v in geometry.split(","))
     else:
         g = scr.geometry()
         x, y, w, h = g.x(), g.y(), g.width(), g.height()
+        if tracker is not None:
+            print("overlay: janela do app não encontrada; cobrindo o monitor até achá-la "
+                  "(apps Wayland nativos não são detectáveis: use --geometry x,y,l,a)")
+    refresh = scr.refreshRate() or 60.0
 
     gpu = gpu_interp if gpu_interp is not None else [False]
     if soft:
@@ -498,10 +514,39 @@ def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geo
         flags |= Qt.WindowType.Tool
     else:
         flags |= Qt.WindowType.X11BypassWindowManagerHint
+        
     view.setFlags(flags)
     view.setGeometry(x, y, w, h)
     view.show()
+    view.setGeometry(x, y, w, h)
     keep_click_through(view)
+
+    cur_geo = [(x, y, w, h)]
+
+    def follow():
+        """Mantém o overlay exatamente sobre a janela do app: move, redimensiona e esconde
+        quando ela é minimizada ou fechada."""
+        try:
+            geo = tracker.poll(time.perf_counter())
+        except Exception as e:
+            print(f"overlay: acompanhamento da janela desligado ({e})")
+            follow_timer.stop()
+            return
+        if geo is None:
+            if tracker.ever_found and view.isVisible():
+                view.hide()
+            return
+        if not view.isVisible():
+            view.show()
+            set_click_through(view.winId())
+        if geo != cur_geo[0]:
+            view.setGeometry(*geo)
+            cur_geo[0] = geo
+
+    follow_timer = QTimer()
+    if tracker is not None:
+        follow_timer.timeout.connect(follow)
+        follow_timer.start(250)
 
     signal.signal(signal.SIGUSR1, lambda *_: on_fg())
     signal.signal(signal.SIGUSR2, lambda *_: hud_on.__setitem__(0, not hud_on[0]))
@@ -516,4 +561,7 @@ def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geo
 
     app.exec()
     pump.stop()
+    follow_timer.stop()
     view.close()
+    if tracker is not None:
+        tracker.close()

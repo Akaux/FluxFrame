@@ -19,7 +19,14 @@ Sem instalar: na pasta do projeto, dois cliques em `Framegen.desktop` (ou no arq
 
 Os ajustes ficam travados enquanto roda (mudar exige reiniciar). "Alternar geração ON/OFF" liga/desliga o FG sem fechar o overlay (equivale a Ctrl+Alt+F).
 
-Em **Avançado**: resolução de processamento (menos = mais leve), monitor do overlay, preenchimento da tela (padrão: sem bordas) e a pasta do `live.py`.
+Em **Avançado**: resolução de processamento (menos = mais leve), janela alvo, monitor do overlay, preenchimento da tela e a pasta do `live.py`.
+
+### Resolução "Automática (Janela)"
+- O overlay **cobre exatamente a janela do app** (posição e tamanho) em vez do monitor inteiro, e a **segue** se você mover ou redimensionar a janela. Se a janela for minimizada ou fechada, o overlay some; quando ela volta, o overlay volta.
+- O processamento usa a largura da janela, limitada a 1280 px (o cálculo do fluxo óptico é na CPU). A imagem é ampliada de volta pelo shader.
+- A janela é achada via X11/XWayland: funciona com jogos Proton/Wine e apps X11. **Apps Wayland nativos não são visíveis**; nesse caso o overlay cobre o monitor (use `--geometry x,y,largura,altura` na linha de comando).
+- Se o painel escolher a janela errada, escreva em **Janela alvo** parte do título ou da classe da janela certa (ex.: `Cyberpunk`).
+- Com uma resolução fixa (720/960/1280 px) o comportamento antigo continua: o overlay cobre o monitor escolhido.
 
 Se algo falhar, a última linha de erro aparece no painel e o log completo fica em `~/.cache/framegen-gui/ultima-execucao.log`.
 

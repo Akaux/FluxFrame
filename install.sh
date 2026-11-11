@@ -27,7 +27,7 @@ sudo pacman -S --needed --noconfirm python python-gobject python-evdev \
 
 echo "==> Copiando arquivos para $DEST"
 mkdir -p "$DEST" "$BIN" "$APPS" "$ICONS"
-cp "$SRC"/{live,overlay,framegen,capture_wayland,bench,hotkeys,framegen_gui}.py "$DEST/"
+cp "$SRC"/{live,overlay,framegen,capture_wayland,bench,hotkeys,winfind,framegen_gui}.py "$DEST/"
 cp "$SRC/framegen" "$DEST/framegen" && chmod +x "$DEST/framegen"   # lançador (sem extensão)
 cp "$SRC/framegen.svg" "$DEST/" && cp "$SRC/framegen.svg" "$ICONS/framegen.svg"
 
