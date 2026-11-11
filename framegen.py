@@ -20,16 +20,20 @@ import numpy as np
 
 
 # ---------------------------------------------------------------- movimento
-def estimate_flow(a, b, scale=0.5):
-    """Farneback: deslocamento (dx, dy) de cada pixel de `a` até `b`.
-    Calculado em resolução reduzida (scale) por velocidade e reescalado depois."""
-    ga = cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)
-    gb = cv2.cvtColor(b, cv2.COLOR_BGR2GRAY)
-    h, w = ga.shape
+def small_gray(img, scale=0.5):
+    """Quadro em tons de cinza na resolução do cálculo do flow (reaproveitável entre pares)."""
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     if scale != 1.0:
+        h, w = g.shape
         size = (max(8, int(w * scale)), max(8, int(h * scale)))
-        ga = cv2.resize(ga, size, interpolation=cv2.INTER_AREA)
-        gb = cv2.resize(gb, size, interpolation=cv2.INTER_AREA)
+        g = cv2.resize(g, size, interpolation=cv2.INTER_AREA)
+    return g
+
+
+def flow_from_gray(ga, gb, scale=0.5, full_size=None):
+    """Farneback entre dois cinzas já reduzidos. O resultado vem em PIXELS DO QUADRO FINAL.
+    full_size=(w, h) reescala o campo para tela cheia; None devolve o campo pequeno
+    (a GPU amostra com filtro bilinear, então não precisa do resize)."""
     flow = cv2.calcOpticalFlowFarneback(
         ga, gb, None,
         pyr_scale=0.5, levels=5, winsize=11, iterations=3,
@@ -41,9 +45,16 @@ def estimate_flow(a, b, scale=0.5):
     mag = cv2.magnitude(fx, fy)
     gain = np.clip((mag - 0.4 * scale) / (0.6 * scale), 0.0, 1.0)
     flow = flow * (gain[..., None] / scale)          # já converte para pixels do quadro final
-    if scale != 1.0:
-        flow = cv2.resize(flow, (w, h), interpolation=cv2.INTER_LINEAR)
+    if full_size is not None and scale != 1.0:
+        flow = cv2.resize(flow, full_size, interpolation=cv2.INTER_LINEAR)
     return flow
+
+
+def estimate_flow(a, b, scale=0.5):
+    """Farneback: deslocamento (dx, dy) de cada pixel de `a` até `b`.
+    Calculado em resolução reduzida (scale) por velocidade e reescalado depois."""
+    h, w = a.shape[:2]
+    return flow_from_gray(small_gray(a, scale), small_gray(b, scale), scale, (w, h))
 
 
 # ----------------------------------------------------------------- warping

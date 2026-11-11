@@ -10,7 +10,15 @@ FPS: a fonte roda em --fps e o programa gera quadros extras até chegar perto de
 --target-fps (60 por padrão).  --fps 30 -> x2 | --fps 20 -> x3 | --fps 15 -> x4.
 Se o cálculo não cabe no tempo, a qualidade do flow cai sozinha (use --no-auto para desligar).
 
-Teclas (a janela framegen precisa estar em foco):
+Modo overlay (--overlay): mostra o resultado POR CIMA da tela, com mouse/teclado atravessando a
+janela (você controla o jogo normalmente). Escolha só a janela do jogo no diálogo do portal
+e deixe o jogo em tela cheia "borderless" ou janelado. Sem teclado: use sinais, ex.
+  Ctrl+Alt+F  liga/desliga FG   |   Ctrl+Alt+H  HUD   |   Ctrl+Alt+N  sair
+  pkill -USR1 -f live.py (liga/desliga FG)    pkill -USR2 -f live.py (HUD)
+Os atalhos globais usam evdev (pip install evdev; usuário no grupo input).
+Detalhes visuais e click-through em overlay.py.
+
+Teclas do modo janela (a janela framegen precisa estar em foco):
   F  liga/desliga a geração de quadros     H  mostra/esconde o HUD
   +/-  aumenta/diminui a janela            0  volta ao tamanho original
   Z  tela cheia                            [ ]  menos/mais qualidade do flow
@@ -20,11 +28,13 @@ Exemplos:
   python live.py --video demo.mp4
   python live.py --screen --fps 30 --width 720
   python live.py --screen --fps 20 --target-fps 60
+  python live.py --screen --overlay --fps 30 --width 1280
 """
 import argparse
 import collections
 import os
 import queue
+import signal
 import sys
 import threading
 import time
@@ -120,6 +130,8 @@ class Source(threading.Thread):
             self.ready.set()                         # libera a espera do 1º quadro
 
     def _use_portal(self):
+        if self.args.overlay:                        # só o portal captura uma janela sem pegar o overlay
+            return True
         return os.environ.get("XDG_SESSION_TYPE") == "wayland" and not self.args.x11
 
     def _run(self):
@@ -141,7 +153,8 @@ class Source(threading.Thread):
             here = os.path.dirname(os.path.abspath(__file__))
             proc = subprocess.Popen(
                 [sys.executable, os.path.join(here, "capture_wayland.py"),
-                 "--width", str(self.args.width), "--fps", str(self.fps)],
+                 "--width", str(self.args.width), "--fps", str(self.fps),
+                 *(["--overlay"] if self.args.overlay else [])],
                 stdout=subprocess.PIPE)
 
             def read_exact(n):
@@ -184,6 +197,115 @@ def sleep_until(t):
         pass
 
 
+
+class GlobalHotkeys:
+    """Escuta atalhos globais sem consumir os eventos do teclado.
+
+    O evdev lê os eventos diretamente dos dispositivos de entrada; não usa grab(),
+    portanto Ctrl+Alt+F/H/N também continua chegando ao jogo/aplicativo em foco.
+    Em Wayland, o acesso normalmente exige evdev instalado e permissão ao /dev/input.
+    """
+
+    def __init__(self, on_fg, on_hud, on_quit):
+        self.on_fg = on_fg
+        self.on_hud = on_hud
+        self.on_quit = on_quit
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="framegen-hotkeys", daemon=True)
+        self.available = False
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+
+    def _run(self):
+        try:
+            import select
+            import evdev
+            from evdev import ecodes
+        except ImportError:
+            print("Atalhos globais indisponíveis: instale com 'pip install evdev'.")
+            return
+
+        ctrl_codes = {ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL}
+        alt_codes = {ecodes.KEY_LEFTALT, ecodes.KEY_RIGHTALT}
+        action_codes = {
+            ecodes.KEY_F: self.on_fg,
+            ecodes.KEY_H: self.on_hud,
+            ecodes.KEY_N: self.on_quit,
+        }
+        devices = {}
+        pressed = {}
+        self.available = True
+        print("Atalhos globais: Ctrl+Alt+F (FG), Ctrl+Alt+H (HUD), Ctrl+Alt+N (sair).")
+
+        warned_no_device = False
+        try:
+            while not self.stop_event.is_set():
+                # Detecta teclados conectados depois da inicialização também.
+                for path in evdev.list_devices():
+                    if path in devices:
+                        continue
+                    try:
+                        dev = evdev.InputDevice(path)
+                        keys = dev.capabilities().get(ecodes.EV_KEY, [])
+                        if not (ctrl_codes | alt_codes | set(action_codes)).intersection(keys):
+                            dev.close()
+                            continue
+                        devices[path] = dev
+                        pressed[path] = set()
+                    except (PermissionError, OSError):
+                        continue
+
+                if not devices:
+                    if not warned_no_device:
+                        print("Nenhum teclado acessível via evdev; use os sinais USR1/USR2 ou verifique /dev/input.")
+                        warned_no_device = True
+                    self.stop_event.wait(1.0)
+                    continue
+
+                ready, _, _ = select.select([d.fd for d in devices.values()], [], [], 0.25)
+                for fd in ready:
+                    dev = next((d for d in devices.values() if d.fd == fd), None)
+                    if dev is None:
+                        continue
+                    try:
+                        events = list(dev.read())
+                    except (OSError, RuntimeError):
+                        path = dev.path
+                        devices.pop(path, None)
+                        pressed.pop(path, None)
+                        try:
+                            dev.close()
+                        except OSError:
+                            pass
+                        continue
+
+                    held = pressed[dev.path]
+                    for event in events:
+                        if event.type != ecodes.EV_KEY:
+                            continue
+                        if event.value == 0:  # soltou
+                            held.discard(event.code)
+                            continue
+                        if event.value != 1:  # ignora repetição automática
+                            continue
+                        held.add(event.code)
+                        if held.intersection(ctrl_codes) and held.intersection(alt_codes):
+                            action = action_codes.get(event.code)
+                            if action:
+                                action()
+        finally:
+            for dev in devices.values():
+                try:
+                    dev.close()
+                except OSError:
+                    pass
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -200,8 +322,21 @@ def main():
     p.add_argument("--no-auto", action="store_true", help="desliga a qualidade adaptativa")
     p.add_argument("--window-scale", type=float, default=1.0, help="zoom inicial da janela")
     p.add_argument("--headless", action="store_true", help="sem janela (só estatísticas)")
+    p.add_argument("--overlay", action="store_true",
+                   help="exibe por cima da tela, click-through (precisa de PySide6 e PyOpenGL)")
+    p.add_argument("--output", type=int, default=0, help="overlay: monitor (0 = primeiro)")
+    p.add_argument("--geometry", help="overlay: x,y,largura,altura (padrão: monitor inteiro)")
+    p.add_argument("--sharpness", type=float, default=0.2,
+                   help="overlay: nitidez RCAS (0 = máxima, 2 = suave, negativo desliga)")
+    p.add_argument("--soft", action="store_true", help="overlay sem OpenGL (QPainter, mais lento)")
+    p.add_argument("--managed", action="store_true",
+                   help="overlay como janela normal (sem override-redirect), se o seu WM reclamar")
+    p.add_argument("--no-global-hotkeys", action="store_true",
+                   help="desativa os atalhos globais Ctrl+Alt+F/H/N (modo overlay)")
     p.add_argument("--seconds", type=float, default=0, help="duração (0 = até fechar)")
     args = p.parse_args()
+    if args.overlay and (args.headless or args.x11):
+        p.error("--overlay não combina com --headless nem --x11")
     if args.headless and not args.seconds:
         args.seconds = 8
 
@@ -225,6 +360,34 @@ def main():
     q = queue.Queue()                             # fila de saída: (hora_de_exibir, quadro, fg)
     stop = threading.Event()
     start = time.perf_counter()
+
+    # Os sinais permitem controlar o FrameGen mesmo quando o jogo está em foco.
+    # O evdev abaixo oferece os mesmos comandos por teclado, sem roubar o foco.
+    def toggle_fg():
+        fg_on[0] = not fg_on[0]
+        print(f"\nFrame Generation: {'ON' if fg_on[0] else 'OFF'}")
+
+    def toggle_hud():
+        hud_on[0] = not hud_on[0]
+        print(f"\nHUD: {'ON' if hud_on[0] else 'OFF'}")
+
+    def request_quit():
+        stop.set()
+        with src.cond:
+            src.ended = True
+            src.cond.notify_all()
+        # SIGINT interrompe também o event loop Qt do overlay e executa o finally.
+        os.kill(os.getpid(), signal.SIGINT)
+
+    if hasattr(signal, "SIGUSR1"):
+        signal.signal(signal.SIGUSR1, lambda *_: toggle_fg())
+    if hasattr(signal, "SIGUSR2"):
+        signal.signal(signal.SIGUSR2, lambda *_: toggle_hud())
+
+    hotkeys = None
+    if args.overlay and not args.no_global_hotkeys:
+        hotkeys = GlobalHotkeys(toggle_fg, toggle_hud, request_quit)
+        hotkeys.start()
 
     def processor():
         """Gera os quadros intermediários e agenda a exibição.
@@ -281,9 +444,18 @@ def main():
     def apply_zoom():
         cv2.resizeWindow(WIN, int(canvas_w * zoom[0]), int(canvas_h * zoom[0]))
 
-    if not args.headless:
+    if not args.headless and not args.overlay:
         cv2.namedWindow(WIN, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_NORMAL)
         apply_zoom()
+
+    def hud_lines(now, label_on):
+        out_fps = sum(1 for t in shown if now - t <= 1.0)
+        avg = np.mean(proc_ms) if proc_ms else 0
+        l1 = (f"FG {'ON x' + str(factor) if label_on else 'OFF'} | saida {out_fps} fps"
+              f" (alvo {src.fps * factor:.0f}) | fonte {src.fps:.0f} fps")
+        l2 = (f"proc {avg:.0f}/{interval * 1000:.0f} ms | escala {qscale[0]:.2f}"
+              f" | atrasos {st['late']} pulos {st['skipped']} descartes {src.dropped}")
+        return l1, l2
 
     def show(frame, label_on):
         now = time.perf_counter()
@@ -299,13 +471,7 @@ def main():
             view = letterbox(frame, win_wh[0], win_wh[1])   # mantém a proporção ao redimensionar
         if hud_on[0]:
             view = view.copy()
-            out_fps = sum(1 for t in shown if now - t <= 1.0)
-            avg = np.mean(proc_ms) if proc_ms else 0
-            l1 = (f"FG {'ON x' + str(factor) if label_on else 'OFF'} | saida {out_fps} fps"
-                  f" (alvo {src.fps * factor:.0f}) | fonte {src.fps:.0f} fps")
-            l2 = (f"proc {avg:.0f}/{interval * 1000:.0f} ms | escala {qscale[0]:.2f}"
-                  f" | atrasos {st['late']} pulos {st['skipped']} descartes {src.dropped}")
-            for i, txt in enumerate((l1, l2)):
+            for i, txt in enumerate(hud_lines(now, label_on)):
                 y = 22 + i * 20
                 cv2.putText(view, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
                 cv2.putText(view, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
@@ -342,8 +508,8 @@ def main():
     proc_thread = threading.Thread(target=processor, daemon=True)
     proc_thread.start()
 
-    try:
-        while True:
+    def window_loop():
+        while not stop.is_set():
             if args.seconds and time.perf_counter() - start > args.seconds:
                 break
             try:
@@ -364,15 +530,29 @@ def main():
                 break
             if key != 255 and key != -1:
                 handle_key(key)
+
+    try:
+        if args.overlay:
+            from overlay import run_overlay          # Qt no thread principal; o resto roda nos threads
+            run_overlay(q, src.size, st, shown, hud_lines, hud_on,
+                        lambda: fg_on.__setitem__(0, not fg_on[0]),
+                        output=args.output, geometry=args.geometry, soft=args.soft,
+                        managed=args.managed, sharpness=args.sharpness, seconds=args.seconds)
+        else:
+            window_loop()
+    except KeyboardInterrupt:
+        pass
     finally:
         stop.set()
+        if hotkeys is not None:
+            hotkeys.stop()
         with src.cond:
             src.ended = True
             src.cond.notify_all()
         proc_thread.join(3)                      # espera as threads terminarem antes de sair
         src.join(3)
         pool.shutdown(wait=True)
-        if not args.headless:
+        if not args.headless and not args.overlay:
             cv2.destroyAllWindows()
 
     dur = time.perf_counter() - start

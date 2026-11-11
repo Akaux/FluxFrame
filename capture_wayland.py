@@ -20,9 +20,12 @@ AJUDA = (
 
 
 class PortalCapture:
-    def __init__(self, width=960, timeout=120):
+    def __init__(self, width=960, timeout=120, overlay=False):
         self.width = width
         self.timeout = timeout
+        # Modo overlay: só janelas (escolher a tela inteira capturaria o próprio overlay) e
+        # cursor oculto (o cursor real do sistema fica por cima do overlay, sem atraso).
+        self.overlay = overlay
         self._frame = None
         self._lock = threading.Lock()
         self._n = itertools.count(1)
@@ -80,9 +83,10 @@ class PortalCapture:
 
         self._request(
             "SelectSources", lambda o: GLib.Variant("(oa{sv})", (session, o)),
-            {"types": GLib.Variant("u", 3),          # 1 = tela, 2 = janela
+            {"types": GLib.Variant("u", 2 if self.overlay else 3),   # 1 = tela, 2 = janela
              "multiple": GLib.Variant("b", False),
-             "cursor_mode": GLib.Variant("u", 2)})   # cursor desenhado no vídeo
+             # 1 = oculto, 2 = desenhado no vídeo
+             "cursor_mode": GLib.Variant("u", 1 if self.overlay else 2)})
         res = self._request(
             "Start", lambda o: GLib.Variant("(osa{sv})", (session, "", o)), {})
         node = res["streams"][0][0]
@@ -139,8 +143,9 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--width", type=int, default=960)
     ap.add_argument("--fps", type=float, default=30.0)
+    ap.add_argument("--overlay", action="store_true", help="só janelas, cursor oculto")
     a = ap.parse_args()
-    cap = PortalCapture(a.width)
+    cap = PortalCapture(a.width, overlay=a.overlay)
     try:
         cap.start()
     except RuntimeError as e:
