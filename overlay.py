@@ -1,11 +1,27 @@
 """
-Overlay "máscara" do framegen otimizado.
+Overlay do FluxFrame: janela Qt/OpenGL que mostra o frame capturado (ou gerado) com
+upscale FSR/DLSS e click-through.
+
+Modos de upscale (--fsr-mode):
+  fsr1   espacial leve: EASU 4x4 + RCAS (16 taps)
+  fsr2   espacial + acumulação temporal (TAA com motion vectors do flow)
+  fsr3   fsr2 + frame gen (o FG já é ligado por padrão no overlay)
+  dlss1  temporal + upscale bilateral 6x6 + Sobel (GPU-heavy)
+  fsr4   comportamento antigo (sem temporal, sem upscale pesado)
+
+Regra: o overlay SEMPRE cobre o monitor inteiro. O conteúdo é escalado pelo shader
+(EASU/RCAS ou DLSS_FRAG). `follow_size` controla apenas se o overlay troca de monitor
+quando a janela do jogo muda de monitor.
 """
 import collections
+import ctypes
+import ctypes.util
 import os
 import queue
 import signal
+import sys
 import time
+import traceback
 
 os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
 os.environ["QT_QPA_PLATFORM"] = "xcb"
@@ -14,11 +30,12 @@ os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "0"
 os.environ.pop("QT_SCALE_FACTOR", None)
 
 import numpy as np
-from framegen import GenRef
-from PySide6.QtCore import QEvent, QPoint, QRect, Qt, QTimer
-from PySide6.QtGui import (QColor, QFont, QGuiApplication, QImage, QPainter,
-                           QRasterWindow, QSurfaceFormat)
+from PySide6.QtCore import QEvent, QPoint, Qt, QTimer
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QSurfaceFormat
 from PySide6.QtOpenGL import QOpenGLWindow
+
+from framegen import GenRef
+
 
 VERT = """#version 330 core
 out vec2 uv;
@@ -104,6 +121,115 @@ void main() {
 }
 """
 
+TEMPORAL_FRAG = """#version 330 core
+in vec2 uv;
+out vec4 fragColor;
+uniform sampler2D texHistory;
+uniform sampler2D texCurrent;
+uniform sampler2D texFlow;
+uniform vec2  size;
+uniform float alpha;
+
+void main() {
+    vec2 p = uv * size;
+    vec2 flow = texture(texFlow, uv).rg;
+    vec3 cur = texture(texCurrent, uv).rgb;
+    vec3 hist = texture(texHistory, (p - flow) / size).rgb;
+
+    vec2 px = 1.0 / size;
+    vec3 mn = cur, mx = cur;
+    for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++) {
+            if (i == 0 && j == 0) continue;
+            vec3 s = texture(texCurrent, uv + vec2(i, j) * px).rgb;
+            mn = min(mn, s);
+            mx = max(mx, s);
+        }
+    vec3 mid = 0.5 * (mn + mx);
+    vec3 ext = 0.5 * (mx - mn) * 1.25;
+    hist = clamp(hist, mid - ext, mid + ext);
+
+    float m = clamp(length(flow) / 8.0, 0.0, 1.0);
+    float a = mix(alpha, 0.9, m);
+    fragColor = vec4(mix(hist, cur, a), 1.0);
+}
+"""
+
+DLSS_FRAG = """#version 330 core
+in vec2 uv;
+out vec4 fragColor;
+uniform sampler2D tex;
+uniform vec2 srcSize;
+uniform vec2 dstSize;
+
+vec3 T(ivec2 p) { return texelFetch(tex, clamp(p, ivec2(0), ivec2(srcSize) - 1), 0).rgb; }
+float L(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+float sinc(float x) {
+    if (abs(x) < 1e-4) return 1.0;
+    return sin(3.14159265 * x) / (3.14159265 * x);
+}
+float lanczos3(float x) {
+    x = abs(x);
+    if (x >= 3.0) return 0.0;
+    return sinc(x) * sinc(x / 3.0);
+}
+
+void main() {
+    vec2 p  = uv * srcSize - 0.5;
+    ivec2 ip = ivec2(floor(p));
+    vec2  f  = p - vec2(ip);
+
+    vec3 c_center = T(ip);
+    float l_center = L(c_center);
+
+    float gx = 0.0, gy = 0.0;
+    for (int j = -2; j <= 2; j++)
+        for (int i = -2; i <= 2; i++) {
+            float l = L(T(ip + ivec2(i, j)));
+            gx += float(i) * l;
+            gy += float(j) * l;
+        }
+    vec2 grad = vec2(gx, gy);
+    float gmag = length(grad);
+    vec2 gdir = gmag > 1e-4 ? grad / gmag : vec2(1.0, 0.0);
+    vec2 perp = vec2(-gdir.y, gdir.x);
+
+    float sharp = clamp(gmag * 3.0, 0.0, 1.0);
+    float along = 1.0 - 0.4 * sharp;
+    float across = 1.0 + 0.6 * sharp;
+
+    vec3 sum = vec3(0.0);
+    float wsum = 0.0;
+    for (int j = -3; j <= 2; j++)
+        for (int i = -3; i <= 2; i++) {
+            vec2 d = vec2(float(i), float(j)) - f;
+            float da = dot(d, gdir) * along;
+            float dp = dot(d, perp) * across;
+            float w = lanczos3(length(vec2(da, dp)));
+
+            vec3 s = T(ip + ivec2(i, j));
+            float dl = abs(L(s) - l_center);
+            w *= 1.0 / (1.0 + dl * dl * 4.0);
+
+            sum += s * w;
+            wsum += w;
+        }
+    vec3 o = sum / max(wsum, 1e-5);
+
+    vec3 mn = c_center, mx = c_center;
+    for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++) {
+            vec3 s = T(ip + ivec2(i, j));
+            mn = min(mn, s);
+            mx = max(mx, s);
+        }
+    o = clamp(o, mn, mx);
+
+    fragColor = vec4(o, 1.0);
+}
+"""
+
 INTERP_FRAG = """#version 330 core
 out vec4 fragColor;
 uniform sampler2D texA;
@@ -136,6 +262,11 @@ void main() {
     fragColor = vec4(mix(mix(wa, wb, t), nearest, occ), 1.0);
 }
 """
+
+
+def _log(msg):
+    print(f"overlay: {msg}", file=sys.stderr, flush=True)
+
 
 class Feed:
     MAX_BUF = 24
@@ -172,20 +303,25 @@ class Feed:
             pick = self.buf.popleft()
             n += 1
         if pick is not None:
-            when, frame, on = pick
+            if len(pick) == 4:
+                when, frame, on, flow = pick
+            else:
+                when, frame, on = pick
+                flow = None
             self.st["stale"] += n - 1
             if now - when > self.period:
                 self.st["late"] += 1
             self.st["shown"] += 1
             self.present(now, on)
-            self.cur, self.new = (frame, on), True
+            self.cur, self.new = (frame, on, flow), True
         return now
 
     def hud(self, now):
         if not self.hud_on[0] or self.cur is None:
             return None
         if now - self._hud_t >= 0.25 or self._hud_fg != self.cur[1]:
-            self._hud_lines, self._hud_t, self._hud_fg = self.hud_lines(now, self.cur[1]), now, self.cur[1]
+            self._hud_lines, self._hud_t, self._hud_fg = (
+                self.hud_lines(now, self.cur[1]), now, self.cur[1])
         return self._hud_lines
 
 
@@ -195,11 +331,18 @@ FIT_MODE = "auto"
 def _fit(w, h, W, H):
     global FIT_MODE
     mode = FIT_MODE
-    if mode == "auto":
-        return 0, 0, W, H
     if mode == "stretch":
         return 0, 0, W, H
-    s = max(W / w, H / h) if mode == "crop" else min(W / w, H / h)
+    if mode == "auto":
+        src_aspect = w / h
+        dst_aspect = W / H
+        if abs(src_aspect - dst_aspect) / dst_aspect < 0.06:
+            return 0, 0, W, H
+        mode = "fit"
+    if mode == "crop":
+        s = max(W / w, H / h)
+    else:
+        s = min(W / w, H / h)
     vw, vh = max(1, int(w * s)), max(1, int(h * s))
     return (W - vw) // 2, (H - vh) // 2, vw, vh
 
@@ -216,8 +359,6 @@ def _draw_hud(p, lines):
 
 
 def set_click_through(win_id):
-    import ctypes
-    import ctypes.util
     try:
         x11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
         xfx = ctypes.CDLL(ctypes.util.find_library("Xfixes") or "libXfixes.so.3")
@@ -246,10 +387,6 @@ def set_click_through(win_id):
 
 
 def set_transient_for(overlay_id, parent_id):
-    """Marca o overlay como janela-filha (transient) da janela do jogo: o WM
-    minimiza/mostra o overlay junto com o jogo, sem que o overlay fique 'órfão'."""
-    import ctypes
-    import ctypes.util
     try:
         x11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
         x11.XOpenDisplay.restype = ctypes.c_void_p
@@ -270,6 +407,64 @@ def set_transient_for(overlay_id, parent_id):
         return False
 
 
+def set_fullscreen_hint(win_id):
+    """Envia _NET_WM_STATE_FULLSCREEN ao WM. É o que faz o KDE esconder o painel/taskbar
+    por baixo do overlay, sem usar X11BypassWindowManagerHint (que travaria Alt+Tab).
+    Tudo dentro de try/except: se falhar, o overlay ainda funciona (só com o painel visível)."""
+    try:
+        x11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XInternAtom.restype = ctypes.c_ulong
+        x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        x11.XDefaultRootWindow.restype = ctypes.c_ulong
+        x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        x11.XSendEvent.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+                                    ctypes.c_long, ctypes.c_void_p]
+        x11.XFlush.argtypes = [ctypes.c_void_p]
+        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+
+        class _XClientMessageEvent(ctypes.Structure):
+            _fields_ = [
+                ("type", ctypes.c_int),
+                ("serial", ctypes.c_ulong),
+                ("send_event", ctypes.c_int),
+                ("display", ctypes.c_void_p),
+                ("window", ctypes.c_ulong),
+                ("message_type", ctypes.c_ulong),
+                ("format", ctypes.c_int),
+                ("data", ctypes.c_long * 5),
+            ]
+
+        dpy = x11.XOpenDisplay(None)
+        if not dpy:
+            _log("set_fullscreen_hint: XOpenDisplay falhou")
+            return
+        try:
+            root = x11.XDefaultRootWindow(dpy)
+            wm_state = x11.XInternAtom(dpy, b"_NET_WM_STATE", 0)
+            wm_fs = x11.XInternAtom(dpy, b"_NET_WM_STATE_FULLSCREEN", 0)
+            ev = _XClientMessageEvent()
+            ev.type = 33  # ClientMessage
+            ev.send_event = 1
+            ev.display = dpy
+            ev.window = int(win_id)
+            ev.message_type = wm_state
+            ev.format = 32
+            ev.data[0] = 1  # _NET_WM_STATE_ADD
+            ev.data[1] = wm_fs
+            ev.data[2] = 1  # source indication (1 = app normal)
+            ev.data[3] = 1  # initial
+            ev.data[4] = 0
+            mask = (1 << 20) | (1 << 19)  # SubstructureRedirect | SubstructureNotify
+            x11.XSendEvent(dpy, root, 0, mask, ctypes.byref(ev))
+            x11.XFlush(dpy)
+        finally:
+            x11.XCloseDisplay(dpy)
+    except Exception as e:
+        _log(f"set_fullscreen_hint falhou: {e}")
+
+
 def keep_click_through(view):
     set_click_through(view.winId())
     timer = QTimer(view)
@@ -279,16 +474,25 @@ def keep_click_through(view):
 
 
 class GLView(QOpenGLWindow):
-    def __init__(self, feed, rcas, gpu_flag):
+    def __init__(self, feed, rcas, gpu_flag, fsr_mode="fsr1"):
         super().__init__()
         self.feed, self.rcas = feed, rcas
         self.gpu_flag = gpu_flag
+        self.fsr_mode = fsr_mode
         self.gl_ok = True
         self.interp_ok = False
+        self.temporal_ok = fsr_mode in ("fsr2", "fsr3", "dlss1")
+        self.dlss_ok = fsr_mode == "dlss1"
         self.frames = collections.OrderedDict()
         self.flows = collections.OrderedDict()
         self.fbo = self.fbo_tex = self.fbo_size = None
+        self.hist_tex_a = None
+        self.hist_tex_b = None
+        self.hist_size = None
+        self.hist_initialized = False
+        self.hist_fbo = None
         self.last = 0.0
+        self._logged_first = False
 
         tick = QTimer(self)
         tick.setTimerType(Qt.TimerType.PreciseTimer)
@@ -301,35 +505,54 @@ class GLView(QOpenGLWindow):
         if self.feed.due(now) or now - self.last >= 0.1:
             self.update()
 
+    def _compile(self, frag):
+        from OpenGL.GL import shaders
+        from OpenGL import GL
+        return shaders.compileProgram(
+            shaders.compileShader(VERT, GL.GL_VERTEX_SHADER),
+            shaders.compileShader(frag, GL.GL_FRAGMENT_SHADER),
+            validate=False)
+
     def initializeGL(self):
         try:
             from OpenGL import GL
-            from OpenGL.GL import shaders
             self.GL = GL
-            self.prog = shaders.compileProgram(
-                shaders.compileShader(VERT, GL.GL_VERTEX_SHADER),
-                shaders.compileShader(FRAG, GL.GL_FRAGMENT_SHADER),
-                validate=False)
+            self.prog = self._compile(FRAG)
             self.vao = GL.glGenVertexArrays(1)
             self.loc = {n: GL.glGetUniformLocation(self.prog, n)
                         for n in ("tex", "srcSize", "dstSize", "rcas")}
-        except Exception:
+        except Exception as e:
+            _log(f"FSR 1 indisponível: {e}")
             self.gl_ok = False
             self.gpu_flag[0] = False
             return
         if not self.gpu_flag[0]:
             return
         try:
-            self.iprog = shaders.compileProgram(
-                shaders.compileShader(VERT, GL.GL_VERTEX_SHADER),
-                shaders.compileShader(INTERP_FRAG, GL.GL_FRAGMENT_SHADER),
-                validate=False)
+            self.iprog = self._compile(INTERP_FRAG)
             self.iloc = {n: GL.glGetUniformLocation(self.iprog, n)
                          for n in ("texA", "texB", "flowF", "flowB", "size", "t")}
             self.fbo = GL.glGenFramebuffers(1)
             self.interp_ok = True
         except Exception:
             self.gpu_flag[0] = False
+        if self.temporal_ok:
+            try:
+                self.tprog = self._compile(TEMPORAL_FRAG)
+                self.tloc = {n: GL.glGetUniformLocation(self.tprog, n)
+                             for n in ("texHistory", "texCurrent", "texFlow", "size", "alpha")}
+                self.hist_fbo = GL.glGenFramebuffers(1)
+            except Exception as e:
+                _log(f"{self.fsr_mode} temporal indisponível: {e}; usando FSR 1")
+                self.temporal_ok = False
+        if self.dlss_ok:
+            try:
+                self.dprog = self._compile(DLSS_FRAG)
+                self.dloc = {n: GL.glGetUniformLocation(self.dprog, n)
+                             for n in ("tex", "srcSize", "dstSize")}
+            except Exception as e:
+                _log(f"DLSS 1 indisponível: {e}; usando FSR 1")
+                self.dlss_ok = False
 
     def _tex_params(self, GL, filt):
         for k, v in ((GL.GL_TEXTURE_MIN_FILTER, filt), (GL.GL_TEXTURE_MAG_FILTER, filt),
@@ -374,6 +597,16 @@ class GLView(QOpenGLWindow):
                         np.ascontiguousarray(arr, dtype=np.float32))
         return tex
 
+    def _make_rgb8_tex(self, w, h):
+        GL = self.GL
+        tex = GL.glGenTextures(1)
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
+        self._tex_params(GL, GL.GL_LINEAR)
+        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGB8, w, h, 0, GL.GL_BGR,
+                        GL.GL_UNSIGNED_BYTE, None)
+        return tex
+
     def _frame_tex(self, arr):
         return self._cached(self.frames, arr, 6, self._make_frame_tex)
 
@@ -386,12 +619,7 @@ class GLView(QOpenGLWindow):
             return
         if self.fbo_tex is not None:
             GL.glDeleteTextures([self.fbo_tex])
-        self.fbo_tex = GL.glGenTextures(1)
-        GL.glActiveTexture(GL.GL_TEXTURE0)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self.fbo_tex)
-        self._tex_params(GL, GL.GL_NEAREST)
-        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA8, w, h, 0, GL.GL_RGBA,
-                        GL.GL_UNSIGNED_BYTE, None)
+        self.fbo_tex = self._make_rgb8_tex(w, h)
         GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.fbo)
         GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER, GL.GL_COLOR_ATTACHMENT0,
                                   GL.GL_TEXTURE_2D, self.fbo_tex, 0)
@@ -420,16 +648,68 @@ class GLView(QOpenGLWindow):
         GL.glActiveTexture(GL.GL_TEXTURE0)
         return self.fbo_tex
 
+    def _temporal_accumulate(self, frame, flow):
+        GL = self.GL
+        h, w = frame.shape[:2]
+        if self.hist_tex_a is None or self.hist_size != (w, h):
+            if self.hist_tex_a is not None:
+                GL.glDeleteTextures([self.hist_tex_a, self.hist_tex_b])
+            self.hist_tex_a = self._make_rgb8_tex(w, h)
+            self.hist_tex_b = self._make_rgb8_tex(w, h)
+            self.hist_size = (w, h)
+            self.hist_initialized = False
+        if not self.hist_initialized:
+            GL.glActiveTexture(GL.GL_TEXTURE0)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, self.hist_tex_a)
+            GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+            GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGB8, w, h, 0, GL.GL_BGR,
+                            GL.GL_UNSIGNED_BYTE, np.ascontiguousarray(frame))
+            self.hist_initialized = True
+            return self.hist_tex_a
+        cur_tex = self._frame_tex(frame)
+        flow_tex = self._flow_tex(flow)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.hist_fbo)
+        GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER, GL.GL_COLOR_ATTACHMENT0,
+                                  GL.GL_TEXTURE_2D, self.hist_tex_b, 0)
+        GL.glViewport(0, 0, w, h)
+        GL.glUseProgram(self.tprog)
+        for unit, (tex, name) in enumerate(zip(
+                (self.hist_tex_a, cur_tex, flow_tex),
+                ("texHistory", "texCurrent", "texFlow"))):
+            GL.glActiveTexture(GL.GL_TEXTURE0 + unit)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
+            GL.glUniform1i(self.tloc[name], unit)
+        GL.glUniform2f(self.tloc["size"], float(w), float(h))
+        GL.glUniform1f(self.tloc["alpha"], 0.15)
+        GL.glBindVertexArray(self.vao)
+        GL.glDrawArrays(GL.GL_TRIANGLES, 0, 3)
+        GL.glBindVertexArray(0)
+        GL.glUseProgram(0)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.defaultFramebufferObject())
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        self.hist_tex_a, self.hist_tex_b = self.hist_tex_b, self.hist_tex_a
+        return self.hist_tex_a
+
     def paintGL(self):
         self.last = time.perf_counter()
         feed = self.feed
         now = feed.advance()
         dpr = self.devicePixelRatio()
         W, H = max(1, int(self.width() * dpr)), max(1, int(self.height() * dpr))
+        if self.gl_ok:
+            try:
+                from OpenGL import GL as _GL
+                _GL.glViewport(0, 0, W, H)
+                _GL.glClearColor(0, 0, 0, 1)
+                _GL.glClear(_GL.GL_COLOR_BUFFER_BIT)
+            except Exception:
+                pass
         if feed.cur is not None and self.gl_ok:
             try:
                 self._draw_gl(feed, W, H)
-            except Exception:
+            except Exception as e:
+                _log(f"erro no desenho GL: {e}")
+                traceback.print_exc()
                 self.gl_ok = False
                 self.gpu_flag[0] = False
         lines = feed.hud(now)
@@ -447,10 +727,11 @@ class GLView(QOpenGLWindow):
 
     def _draw_gl(self, feed, W, H):
         GL = self.GL
-        frame = feed.cur[0]
-        tex = None
+        frame, on, flow = feed.cur
+
         if isinstance(frame, GenRef):
             h, w = frame.shape[:2]
+            tex = None
             if self.interp_ok:
                 try:
                     tex = self._interp(frame)
@@ -461,45 +742,78 @@ class GLView(QOpenGLWindow):
                     GL.glUseProgram(0)
             if tex is None:
                 frame = frame.render()
+                h, w = frame.shape[:2]
+        elif self.temporal_ok and flow is not None:
+            h, w = frame.shape[:2]
+            tex = self._temporal_accumulate(frame, flow)
+        else:
+            h, w = frame.shape[:2]
+            tex = None
+
         if tex is None:
             tex = self._frame_tex(frame)
             h, w = frame.shape[:2]
+
+        if not self._logged_first:
+            self._logged_first = True
+            try:
+                mean_str = (f"{float(frame.mean()):.1f}"
+                            if isinstance(frame, np.ndarray) else "?")
+                x_, y_, vw_, vh_ = _fit(w, h, W, H)
+                _log(f"primeiro quadro {w}x{h} -> viewport {vw_}x{vh_} "
+                     f"framebuffer {W}x{H} fit={FIT_MODE} brilho médio={mean_str}")
+                if isinstance(frame, np.ndarray) and float(frame.mean()) < 5.0:
+                    _log("AVISO: primeiro quadro quase preto. Se o jogo está em modo "
+                         "janela, ele pode ter pausado ao perder o foco (clique na janela). "
+                         "Verifique também a linha 'Primeiro quadro: WxH, brilho médio X' "
+                         "no terminal do live.py.")
+            except Exception:
+                pass
+
         GL.glViewport(0, 0, W, H)
         GL.glClearColor(0, 0, 0, 1)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
         x, y, vw, vh = _fit(w, h, W, H)
         GL.glViewport(x, y, vw, vh)
-        GL.glUseProgram(self.prog)
+
+        use_dlss = self.dlss_ok and self.fsr_mode == "dlss1"
+        prog = self.dprog if use_dlss else self.prog
+        loc  = self.dloc  if use_dlss else self.loc
+        GL.glUseProgram(prog)
         GL.glActiveTexture(GL.GL_TEXTURE0)
         GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
-        GL.glUniform1i(self.loc["tex"], 0)
-        GL.glUniform2f(self.loc["srcSize"], float(w), float(h))
-        GL.glUniform2f(self.loc["dstSize"], float(vw), float(vh))
-        GL.glUniform1f(self.loc["rcas"], self.rcas)
+        GL.glUniform1i(loc["tex"], 0)
+        GL.glUniform2f(loc["srcSize"], float(w), float(h))
+        GL.glUniform2f(loc["dstSize"], float(vw), float(vh))
+        if not use_dlss:
+            GL.glUniform1f(loc["rcas"], self.rcas)
         GL.glBindVertexArray(self.vao)
         GL.glDrawArrays(GL.GL_TRIANGLES, 0, 3)
         GL.glBindVertexArray(0)
         GL.glUseProgram(0)
 
-    def changeEvent(self, event):
-        if event.type() == QEvent.Type.ActivationChange:
-            if not self.isActiveWindow():
-                QGuiApplication.quit()
-        super().changeEvent(event)
-
 
 def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geometry=None,
                 soft=False, managed=False, mask=False, sharpness=0.2, seconds=0, fit="auto",
-                gpu_interp=None, tracker=None, follow_size=False):
-    """Comportamento do overlay:
-     - `mask=True`: MÁSCARA fullscreen override-redirect (X11BypassWindowManagerHint).
-       Fica acima de TUDO (inclusive Alt+Tab); o follow() tenta esconder quando o jogo perde foco.
-     - `mask=False` (padrão): janela Tool WM-gerenciada COM 'sempre no topo' (WindowStaysOnTopHint).
-       O WM consegue minimizar/Alt+Tab e o follow() esconde quando o jogo minimiza ou fica
-       >1s inativo. Com `follow_size=True` e `set_transient_for` (do live.py), o WM trata o
-       overlay como diálogo do jogo: minimiza junto, mostra junto."""
+                gpu_interp=None, tracker=None, follow_size=False, fsr_mode="fsr1"):
+    """Abre o overlay.
+
+    - O overlay sempre cobre o monitor inteiro; o shader escala o conteúdo (FSR/DLSS).
+    - `Qt::WindowDoesNotAcceptFocus` (flags) impede o `show()` de roubar o foco do jogo.
+    - Depois do `show()`, `_NET_WM_STATE_FULLSCREEN` é enviado via X11 para o WM esconder
+      o painel/taskbar por baixo do overlay (sem usar `X11BypassWindowManagerHint`).
+    - `mask=True` (`--mask`) volta ao comportamento antigo (bypassa o WM, Alt+Tab travado).
+
+    Todos os erros aqui são logados com prefixo `overlay:` no stderr — e o live.py
+    redireciona o stderr para `~/.cache/framegen-gui/ultima-execucao.log` quando
+    iniciado pelo painel.
+    """
     global FIT_MODE
     FIT_MODE = fit
+
+    _log(f"run_overlay inicio: fsr_mode={fsr_mode} fit={fit} mask={mask} "
+         f"follow_size={follow_size} tracker={'sim' if tracker else 'nao'}")
+
     fmt = QSurfaceFormat()
     fmt.setVersion(3, 3)
     fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
@@ -509,44 +823,46 @@ def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geo
     app = QGuiApplication(["framegen-overlay"])
     app.setQuitOnLastWindowClosed(False)
     screens = app.screens()
+    if not screens:
+        _log("QGuiApplication não encontrou telas; abortando")
+        return
     scr = screens[min(max(output, 0), len(screens) - 1)]
+
     track_geo = None
     if tracker is not None:
         try:
             track_geo = tracker.poll(time.perf_counter())
         except Exception as e:
-            print(f"overlay: acompanhamento da janela indisponível ({e})")
+            _log(f"tracker indisponível ({e})")
             tracker = None
-    if follow_size and track_geo:
-        x, y, w, h = track_geo
-        scr = app.screenAt(QPoint(x + w // 2, y + h // 2)) or scr
-    elif geometry:
+    if track_geo:
+        wx, wy, ww, wh = track_geo
+        scr = app.screenAt(QPoint(wx + ww // 2, wy + wh // 2)) or scr
+    elif tracker is not None:
+        _log(f"janela do app ainda não encontrada; usando {scr.name()} até achar.")
+
+    if geometry:
         x, y, w, h = (int(v) for v in geometry.split(","))
     else:
         g = scr.geometry()
         x, y, w, h = g.x(), g.y(), g.width(), g.height()
-        if tracker is not None and follow_size:
-            print("overlay: janela do app não encontrada; cobrindo o monitor até achá-la "
-                  "(apps Wayland nativos não são detectáveis: use --geometry x,y,l,a)")
     refresh = scr.refreshRate() or 60.0
+    _log(f"monitor '{scr.name()}' {w}x{h}+{x}+{y} refresh={refresh:.0f}Hz")
 
     gpu = gpu_interp if gpu_interp is not None else [False]
     if soft:
         gpu[0] = False
     feed = Feed(q, st, present, hud_lines, hud_on, refresh)
-    view = GLView(feed, 0.0 if sharpness < 0 else 2.0 ** -sharpness, gpu)
+    view = GLView(feed, 0.0 if sharpness < 0 else 2.0 ** -sharpness, gpu, fsr_mode=fsr_mode)
     view.setTitle("framegen-overlay")
     view.setScreen(scr)
 
-    # Flags:
-    #  - Por padrão: Tool + StaysOnTop, SEM X11Bypass (WM gerencia normalmente).
-    #  - --managed: idem ao padrão (compat).
-    #  - --mask: adiciona X11Bypass (comportamento antigo). Alt+Tab quebra.
+    # Frame-less + topo + click-through + sem foco. NADA de Qt::Tool, senão o WM
+    # ignora _NET_WM_STATE_FULLSCREEN.
     flags = (Qt.WindowType.FramelessWindowHint
-             | Qt.WindowType.WindowTransparentForInput
-             | Qt.WindowType.WindowDoesNotAcceptFocus
              | Qt.WindowType.WindowStaysOnTopHint
-             | Qt.WindowType.Tool)
+             | Qt.WindowType.WindowTransparentForInput
+             | Qt.WindowType.WindowDoesNotAcceptFocus)
     if mask:
         flags |= Qt.WindowType.X11BypassWindowManagerHint
 
@@ -554,40 +870,29 @@ def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geo
     view.setGeometry(x, y, w, h)
     view.show()
     view.setGeometry(x, y, w, h)
+    _log(f"janela mostrada (winId=0x{int(view.winId()):x})")
+
+    if not mask:
+        set_fullscreen_hint(view.winId())
+
     keep_click_through(view)
 
-    cur_geo = [(x, y, w, h)]
-
     def reparent(parent_id):
-        if parent_id is None:
+        if parent_id is None or mask:
             return False
-        ok = set_transient_for(view.winId(), parent_id)
-        if not ok:
-            print("overlay: set_transient_for falhou (uso apenas o polling)")
-        return ok
+        return set_transient_for(view.winId(), parent_id)
 
     if tracker is not None and tracker.win is not None:
         reparent(tracker.win)
-
-    # follow(): esconde o overlay quando o jogo minimiza OU perde o foco por >1s (Alt+Tab).
-    # Mostra de novo quando o jogo volta a ficar visível/ativo. Se follow_size=True, também
-    # acompanha a geometria da janela.
-    last_active = [time.perf_counter()]
-    inactive_hide_after = 1.0
 
     def follow():
         try:
             geo = tracker.poll(time.perf_counter())
         except Exception as e:
-            print(f"overlay: acompanhamento da janela desligado ({e})")
+            _log(f"follow desligado ({e})")
             follow_timer.stop()
             return
-        now = time.perf_counter()
-        active = tracker.is_active() if tracker.win else True
-        if active:
-            last_active[0] = now
-        inactive_too_long = (not active) and (now - last_active[0] > inactive_hide_after)
-        if geo is None or inactive_too_long:
+        if geo is None:
             if tracker.ever_found and view.isVisible():
                 view.hide()
             return
@@ -596,11 +901,17 @@ def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geo
             set_click_through(view.winId())
             if tracker.win is not None:
                 reparent(tracker.win)
-        if follow_size and geo != cur_geo[0]:
-            view.setGeometry(*geo)
-            cur_geo[0] = geo
-            if tracker.win is not None:
-                reparent(tracker.win)
+        if not follow_size:
+            return
+        wx, wy, ww, wh = geo
+        new_scr = app.screenAt(QPoint(wx + ww // 2, wy + wh // 2))
+        if new_scr and new_scr != view.screen():
+            _log(f"janela mudou para o monitor '{new_scr.name()}'")
+            view.setScreen(new_scr)
+            g = new_scr.geometry()
+            view.setGeometry(g.x(), g.y(), g.width(), g.height())
+            if not mask:
+                set_fullscreen_hint(view.winId())
 
     follow_timer = QTimer()
     if tracker is not None:
@@ -618,9 +929,13 @@ def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geo
     if seconds:
         QTimer.singleShot(int(seconds * 1000), app.quit)
 
-    app.exec()
-    pump.stop()
-    follow_timer.stop()
-    view.close()
-    if tracker is not None:
-        tracker.close()
+    _log("entrando no event loop")
+    try:
+        app.exec()
+    finally:
+        _log("saindo do event loop")
+        pump.stop()
+        follow_timer.stop()
+        view.close()
+        if tracker is not None:
+            tracker.close()

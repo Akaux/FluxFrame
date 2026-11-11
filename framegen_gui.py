@@ -19,11 +19,26 @@ LOG = CACHE / "ultima-execucao.log"
 TARGETS = (30, 45, 60, 75, 90, 120, 144, 165, 240, 0)
 START_MARKERS = ("Primeiro quadro", "SAIDA", "FG ON")
 
+# (valor, rótulo curto, descrição para o tooltip/hint)
+FSR_MODES = (
+    ("fsr1",  "FSR 1 — Espacial (leve)",
+     "EASU 4×4 + RCAS. Roda em qualquer GPU. É o modo mais leve."),
+    ("fsr2",  "FSR 2 — Temporal (TAA)",
+     "FSR 1 + acumulação temporal com motion vectors do flow. Reduz shimmer/aliasing."),
+    ("fsr3",  "FSR 3 — Temporal + FG",
+     "FSR 2 + frame gen (que já é ligado por padrão no overlay). Recomendado."),
+    ("dlss1", "DLSS 1 — GPU-heavy",
+     "Temporal + bilateral 6×6 + Sobel (144 reads/px). Alivia a CPU, pesa na GPU."),
+    ("fsr4",  "FSR 4 — Escala ×N (legado)",
+     "Modo antigo: multiplica o fator de quadros por --scale-factor (1x/4x)."),
+)
+
 
 def build_args(cfg):
     args = ["--screen", "--overlay", "--mult", str(cfg["mult"]),
             "--width", str(cfg["width"]), "--output", str(cfg["monitor"]),
-            "--fit", cfg["fit"], "--fsr-mode", cfg["fsr_mode"], "--scale-factor", str(cfg["scale_factor"])]
+            "--fit", cfg["fit"], "--fsr-mode", cfg["fsr_mode"],
+            "--scale-factor", str(cfg["scale_factor"])]
     if cfg.get("window"):
         args += ["--window", cfg["window"]]
     if cfg["unlimited"]:
@@ -130,6 +145,11 @@ QPushButton#link {{ background: transparent; border: none; color: {ACCENT}; padd
 QSlider::groove:horizontal {{ height: 6px; background: {EDGE}; border-radius: 3px; }}
 QSlider::sub-page:horizontal {{ background: {ACCENT}; border-radius: 3px; }}
 QSlider::handle:horizontal {{ background: {TEXT}; width: 18px; height: 18px; margin: -6px 0; border-radius: 9px; }}
+QComboBox {{ background: {CARD}; border: 1px solid {EDGE}; border-radius: 8px;
+             padding: 6px 10px; color: {TEXT}; min-height: 20px; }}
+QComboBox:hover {{ border-color: {ACCENT}; }}
+QComboBox QAbstractItemView {{ background: {CARD}; color: {TEXT};
+                               selection-background-color: {ACCENT}; selection-color: #0f1014; }}
 """
 
 
@@ -187,6 +207,7 @@ class Panel(QWidget):
         head.addWidget(self.pill)
         root.addLayout(head)
 
+        # ---------------- multiplicador
         card = QFrame(); card.setObjectName("card")
         cl = QVBoxLayout(card); cl.setContentsMargins(16, 14, 16, 16); cl.setSpacing(10)
         row = QHBoxLayout()
@@ -202,23 +223,25 @@ class Panel(QWidget):
         cl.addWidget(self.slider)
         root.addWidget(card)
 
+        # ---------------- FSR / DLSS (COMBO com as 5 opções)
         card_fsr = QFrame(); card_fsr.setObjectName("card")
         cf_l = QVBoxLayout(card_fsr); cf_l.setContentsMargins(16, 14, 16, 16); cf_l.setSpacing(10)
-        cf_l.addWidget(self._label("TECNOLOGIA FSR & ESCALA DE FLUIDEZ", "section"))
+        cf_l.addWidget(self._label("UPSCALER (FSR 1/2/3/4 e DLSS 1)", "section"))
 
-        fsr_row = QHBoxLayout()
-        self.rb_fsr1 = QRadioButton("FSR 1")
-        self.rb_fsr4 = QRadioButton("FSR 4")
-        self.rb_fsr1.setChecked(True)
-        self.rb_fsr1.toggled.connect(self._update_scale_availability)
-        fsr_row.addWidget(self.rb_fsr1)
-        fsr_row.addWidget(self.rb_fsr4)
-        cf_l.addLayout(fsr_row)
+        self.cb_fsr = QComboBox()
+        for val, label, _tip in FSR_MODES:
+            self.cb_fsr.addItem(label, val)
+        self.cb_fsr.currentIndexChanged.connect(self._on_fsr_changed)
+        cf_l.addWidget(self.cb_fsr)
 
+        self.fsr_hint = self._label("", "dim", True)
+        cf_l.addWidget(self.fsr_hint)
+
+        # Escala de fluidez: SÓ existe no modo FSR 4 (legado).
         scale_row = QHBoxLayout()
-        scale_row.addWidget(self._label("Fluidez FSR 4:"))
-        self.rb_scale1 = QRadioButton("1x (Padrão)")
-        self.rb_scale4 = QRadioButton("4x (Super Fluidez)")
+        scale_row.addWidget(self._label("Escala de fluidez (FSR 4):"))
+        self.rb_scale1 = QRadioButton("1x (padrão)")
+        self.rb_scale4 = QRadioButton("4x")
         self.rb_scale1.setChecked(True)
         self.rb_scale1.toggled.connect(self._refresh)
         self.rb_scale4.toggled.connect(self._refresh)
@@ -227,6 +250,7 @@ class Panel(QWidget):
         cf_l.addLayout(scale_row)
         root.addWidget(card_fsr)
 
+        # ---------------- FPS alvo
         card2 = QFrame(); card2.setObjectName("card")
         c2 = QVBoxLayout(card2); c2.setContentsMargins(16, 14, 16, 16); c2.setSpacing(10)
         c2.addWidget(self._label("FPS ALVO", "section"))
@@ -259,6 +283,7 @@ class Panel(QWidget):
         self.adv_btn.clicked.connect(self._toggle_adv)
         root.addWidget(self.adv_btn, alignment=Qt.AlignmentFlag.AlignLeft)
 
+        # ---------------- avançado
         self.adv = QFrame(); self.adv.setObjectName("card"); self.adv.hide()
         al = QVBoxLayout(self.adv); al.setContentsMargins(16, 12, 16, 14); al.setSpacing(10)
 
@@ -293,21 +318,23 @@ class Panel(QWidget):
         self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(self.status)
 
-        # FIX: esta chamada precisa acontecer DEPOIS que todos os widgets existem.
-        # Antes ela estava logo após `root.addWidget(card_fsr)` e explodia em AttributeError
-        # dentro de `_cfg()` (usava self.cb_target, self.cb_fps, self.cb_width, etc. que ainda
-        # não tinham sido criados), impedindo a janela de abrir.
-        self._update_scale_availability()
+        # Todos os widgets existem: agora é seguro consultar _cfg() via _refresh().
+        self._on_fsr_changed()
 
-    def _update_scale_availability(self):
-        is_fsr4 = self.rb_fsr4.isChecked()
+    # ------------------------------------------------------------------ FSR/DLSS
+    def _on_fsr_changed(self, *_):
+        """Chamado quando o combo de FSR muda. Habilita a escala só no FSR 4 e atualiza o hint."""
+        mode = self.cb_fsr.currentData() or "fsr1"
+        is_fsr4 = (mode == "fsr4")
         self.rb_scale1.setEnabled(is_fsr4)
         self.rb_scale4.setEnabled(is_fsr4)
+        hint = next((h for v, _, h in FSR_MODES if v == mode), "")
+        self.fsr_hint.setText(hint)
         self._refresh()
 
     def _cfg(self):
         target = int(self.cb_target.currentData() or 0)
-        fsr_mode = "fsr4" if self.rb_fsr4.isChecked() else "fsr1"
+        fsr_mode = self.cb_fsr.currentData() or "fsr1"
         scale_factor = 4 if (fsr_mode == "fsr4" and self.rb_scale4.isChecked()) else 1
         width_data = self.cb_width.currentData()
         width = "auto" if width_data == "auto" else int(width_data)
@@ -326,6 +353,10 @@ class Panel(QWidget):
         target_default = 0
         i = self.cb_target.findData(target_default)
         self.cb_target.setCurrentIndex(i if i >= 0 else 0)
+        saved_fsr = s.value("fsr_mode", "fsr1", type=str)
+        i = self.cb_fsr.findData(saved_fsr)
+        if i >= 0:
+            self.cb_fsr.setCurrentIndex(i)
 
     def _save(self):
         c = self._cfg()
