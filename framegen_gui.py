@@ -20,27 +20,28 @@ APP_DIR = Path(__file__).resolve().parent
 CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "framegen-gui"
 LOG = CACHE / "ultima-execucao.log"
 TARGETS = (30, 45, 60, 75, 90, 120, 144, 165, 240, 0)    # 0 = ilimitado
-START_MARKERS = ("Primeiro quadro", "SAIDA", "FG ON")     # linhas que o live.py imprime ao rodar
+START_MARKERS = ("Primeiro quadro", "SAIDA", "FG ON")
 
 
-# ------------------------------------------------------------------ lógica
 def build_args(cfg):
     """Opções do live.py para a configuração do painel (compatível com o script original)."""
     args = ["--screen", "--overlay", "--mult", str(cfg["mult"]),
             "--width", str(cfg["width"]), "--output", str(cfg["monitor"]),
-            "--fit", cfg["fit"]]
+            "--fit", cfg["fit"], "--fsr-mode", cfg["fsr_mode"], "--scale-factor", str(cfg["scale_factor"])]
     if cfg["unlimited"]:
-        args += ["--fps", str(cfg["capture_fps"])]          # saída = fps de captura x mult
+        args += ["--fps", str(cfg["capture_fps"]), "--target-fps", "0"]
     else:
-        args += ["--target-fps", str(cfg["target"])]        # captura = alvo / mult
+        args += ["--target-fps", str(cfg["target"])]
     return args
 
 
 def rates(cfg):
-    """(fps de captura, fps de saída, latência em ms). Latência: L = 2*I - I/f (README)."""
+    """(fps de captura, fps de saída, latência em ms)."""
     mult = cfg["mult"]
-    capture = float(cfg["capture_fps"]) if cfg["unlimited"] else cfg["target"] / mult
-    interval = 1.0 / capture
+    if cfg["fsr_mode"] == "fsr4" and cfg["scale_factor"] > 1:
+        mult *= cfg["scale_factor"]
+    capture = float(cfg["capture_fps"]) if cfg["unlimited"] else (cfg["target"] / mult if mult > 0 else 30.0)
+    interval = 1.0 / capture if capture > 0 else 0.033
     return capture, capture * mult, (2 * interval - interval / mult) * 1000
 
 
@@ -56,8 +57,6 @@ def find_folder(saved):
 
 
 class Runner:
-    """Executa o live.py em uma sessão própria (grupo de processos) e acompanha o log."""
-
     def __init__(self):
         self.proc = None
         self.logf = None
@@ -111,7 +110,6 @@ class Runner:
         self._group(signal.SIGKILL)
 
     def finish(self):
-        """Chamado quando o processo principal terminou: limpa filhos soltos e devolve o código."""
         code = self.proc.poll() if self.proc else None
         self._group(signal.SIGTERM)
         if self.logf:
@@ -129,7 +127,6 @@ class Runner:
             pass
 
 
-# ------------------------------------------------------------------- tema
 ACCENT, BG, CARD, EDGE, TEXT, DIM = "#3daee9", "#15161b", "#1d1f27", "#2a2d38", "#e6e8ee", "#8b90a0"
 
 QSS = f"""
@@ -142,26 +139,14 @@ QLabel#pill {{ background: {CARD}; border: 1px solid {EDGE}; border-radius: 10px
                padding: 3px 11px; color: {DIM}; font-size: 12px; }}
 QLabel#pill[live="true"] {{ background: {ACCENT}; border-color: {ACCENT}; color: #0f1014; }}
 QFrame#card {{ background: {CARD}; border: 1px solid #262935; border-radius: 12px; }}
-QFrame#segbar {{ background: {BG}; border: 1px solid #262935; border-radius: 10px; }}
-QPushButton#seg {{ background: transparent; border: none; border-radius: 8px;
-                   padding: 8px 0; color: {DIM}; font-weight: 600; }}
-QPushButton#seg:hover:!checked {{ background: #262935; }}
-QPushButton#seg:checked {{ background: {ACCENT}; color: #0f1014; }}
 QPushButton#go {{ background: {ACCENT}; color: #0f1014; border: none; border-radius: 12px;
                   padding: 15px; font-size: 15px; font-weight: 700; }}
 QPushButton#go:hover {{ background: #5bbcf0; }}
 QPushButton#go[mode="stop"] {{ background: #e5484d; color: #ffffff; }}
-QPushButton#go[mode="stop"]:hover {{ background: #ee6a6e; }}
-QPushButton#go:disabled {{ background: {EDGE}; color: #6b7080; }}
 QPushButton#link {{ background: transparent; border: none; color: {ACCENT}; padding: 4px; }}
-QPushButton#link:hover {{ color: #5bbcf0; }}
 QSlider::groove:horizontal {{ height: 6px; background: {EDGE}; border-radius: 3px; }}
 QSlider::sub-page:horizontal {{ background: {ACCENT}; border-radius: 3px; }}
-QSlider::handle:horizontal {{ background: {TEXT}; width: 18px; height: 18px;
-                              margin: -6px 0; border-radius: 9px; }}
-QSlider::handle:horizontal:hover {{ background: #ffffff; }}
-QSlider::sub-page:horizontal:disabled {{ background: #3a4a55; }}
-QSlider::handle:horizontal:disabled {{ background: #5a5f6e; }}
+QSlider::handle:horizontal {{ background: {TEXT}; width: 18px; height: 18px; margin: -6px 0; border-radius: 9px; }}
 """
 
 
@@ -170,11 +155,8 @@ def dark_palette():
     R, G = QPalette.ColorRole, QPalette.ColorGroup
     for role, col in ((R.Window, BG), (R.WindowText, TEXT), (R.Base, CARD), (R.AlternateBase, CARD),
                       (R.Text, TEXT), (R.Button, CARD), (R.ButtonText, TEXT),
-                      (R.Highlight, ACCENT), (R.HighlightedText, "#0f1014"),
-                      (R.ToolTipBase, CARD), (R.ToolTipText, TEXT), (R.PlaceholderText, "#6b7080")):
+                      (R.Highlight, ACCENT), (R.HighlightedText, "#0f1014")):
         p.setColor(role, QColor(col))
-    for role in (R.Text, R.ButtonText, R.WindowText):
-        p.setColor(G.Disabled, role, QColor("#5a5f6e"))
     return p
 
 
@@ -183,12 +165,11 @@ def repolish(w):
     w.style().polish(w)
 
 
-# ------------------------------------------------------------------ painel
 class Panel(QWidget):
     def __init__(self):
         super().__init__()
         self.setObjectName("root")
-        self.setWindowTitle("Framegen")
+        self.setWindowTitle("Framegen Control")
         icon = APP_DIR / "framegen.svg"
         if icon.exists():
             self.setWindowIcon(QIcon(str(icon)))
@@ -205,7 +186,6 @@ class Panel(QWidget):
         self.timer.timeout.connect(self._tick)
         self.timer.start(400)
 
-    # ---------------------------------------------------------- interface
     def _label(self, text, name="dim", wrap=False):
         lb = QLabel(text)
         lb.setObjectName(name)
@@ -218,17 +198,13 @@ class Panel(QWidget):
         root.setSpacing(14)
 
         head = QHBoxLayout()
-        head.addWidget(self._label("Framegen", "title"))
+        head.addWidget(self._label("Framegen Control", "title"))
         head.addStretch()
         self.pill = self._label("Parado", "pill")
         head.addWidget(self.pill)
         root.addLayout(head)
 
         # Multiplicador
-        self.box = QWidget()
-        bl = QVBoxLayout(self.box)
-        bl.setContentsMargins(0, 0, 0, 0)
-        bl.setSpacing(14)
         card = QFrame(); card.setObjectName("card")
         cl = QVBoxLayout(card); cl.setContentsMargins(16, 14, 16, 16); cl.setSpacing(10)
         row = QHBoxLayout()
@@ -242,12 +218,12 @@ class Panel(QWidget):
         self.slider.setPageStep(1)
         self.slider.valueChanged.connect(self._refresh)
         cl.addWidget(self.slider)
-        bl.addWidget(card)
+        root.addWidget(card)
 
-        # Configuração visual FSR 4 / FSR 1
+        # Tecnologia FSR & Escala de Fluidez
         card_fsr = QFrame(); card_fsr.setObjectName("card")
         cf_l = QVBoxLayout(card_fsr); cf_l.setContentsMargins(16, 14, 16, 16); cf_l.setSpacing(10)
-        cf_l.addWidget(self._label("TECNOLOGIA FSR & ESCALA", "section"))
+        cf_l.addWidget(self._label("TECNOLOGIA FSR & ESCALA DE FLUIDEZ", "section"))
         
         fsr_row = QHBoxLayout()
         self.rb_fsr1 = QRadioButton("FSR 1")
@@ -259,17 +235,19 @@ class Panel(QWidget):
         cf_l.addLayout(fsr_row)
 
         scale_row = QHBoxLayout()
-        scale_row.addWidget(self._label("Fator FSR 4:"))
-        self.rb_scale1 = QRadioButton("1x (Nativo)")
-        self.rb_scale4 = QRadioButton("4x (Superamostragem)")
+        scale_row.addWidget(self._label("Fluidez FSR 4:"))
+        self.rb_scale1 = QRadioButton("1x (Padrão)")
+        self.rb_scale4 = QRadioButton("4x (Super Fluidez)")
         self.rb_scale1.setChecked(True)
+        self.rb_scale1.toggled.connect(self._refresh)
+        self.rb_scale4.toggled.connect(self._refresh)
         scale_row.addWidget(self.rb_scale1)
         scale_row.addWidget(self.rb_scale4)
         cf_l.addLayout(scale_row)
-        bl.addWidget(card_fsr)
+        root.addWidget(card_fsr)
         self._update_scale_availability()
 
-        # FPS alvo (Padrão alterado para Ilimitado / 0)
+        # FPS Alvo / Ilimitado
         card2 = QFrame(); card2.setObjectName("card")
         c2 = QVBoxLayout(card2); c2.setContentsMargins(16, 14, 16, 16); c2.setSpacing(10)
         c2.addWidget(self._label("FPS ALVO", "section"))
@@ -280,6 +258,7 @@ class Panel(QWidget):
         c2.addWidget(self.cb_target)
         self.hint = self._label("", "dim", True)
         c2.addWidget(self.hint)
+        
         self.cap_row = QWidget()
         cr = QHBoxLayout(self.cap_row); cr.setContentsMargins(0, 0, 0, 0)
         cr.addWidget(self._label("FPS do jogo (captura)"))
@@ -290,68 +269,52 @@ class Panel(QWidget):
         self.cb_fps.currentIndexChanged.connect(self._refresh)
         cr.addWidget(self.cb_fps)
         c2.addWidget(self.cap_row)
-        bl.addWidget(card2)
-        root.addWidget(self.box)
+        root.addWidget(card2)
 
         self.info = self._label("", "dim", True)
         self.info.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(self.info)
 
-        # Avançado
+        # Configurações Avançadas Ocultas / Visíveis
         self.adv_btn = QPushButton("Avançado  ▸")
         self.adv_btn.setObjectName("link")
-        self.adv_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.adv_btn.clicked.connect(self._toggle_adv)
         root.addWidget(self.adv_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+        
         self.adv = QFrame(); self.adv.setObjectName("card"); self.adv.hide()
         al = QVBoxLayout(self.adv); al.setContentsMargins(16, 12, 16, 14); al.setSpacing(10)
         self.cb_width = QComboBox()
-        for v, t in ((720, "720 px · leve"), (960, "960 px · padrão"),
-                     (1280, "1280 px · nítido"), (1600, "1600 px · pesado")):
+        for v, t in ((720, "720 px"), (960, "960 px"), (1280, "1280 px")):
             self.cb_width.addItem(t, v)
         self.cb_fit = QComboBox()
-        for v, t in (("stretch", "Preencher a tela · sem bordas"),
-                     ("crop", "Preencher cortando as bordas"),
-                     ("auto", "Automático"),
-                     ("fit", "Manter proporção · com barras")):
+        for v, t in (("stretch", "Preencher"), ("auto", "Automático")):
             self.cb_fit.addItem(t, v)
         self.cb_mon = QComboBox()
         for i, s in enumerate(QApplication.screens()):
             self.cb_mon.addItem(f"{i + 1} · {s.name()}", i)
-        for text, w in (("Resolução de processamento", self.cb_width), ("Monitor do overlay", self.cb_mon),
-                        ("Preenchimento da tela", self.cb_fit)):
+        for text, w in (("Resolução", self.cb_width), ("Monitor", self.cb_mon), ("Ajuste", self.cb_fit)):
             r = QHBoxLayout(); r.addWidget(self._label(text)); r.addStretch(); r.addWidget(w)
             al.addLayout(r)
-        self.folder_lb = self._label("", "dim", True)
-        pick = QPushButton("Alterar pasta do framegen…")
-        pick.setObjectName("link"); pick.clicked.connect(self._pick_folder)
-        al.addWidget(self.folder_lb)
-        al.addWidget(pick, alignment=Qt.AlignmentFlag.AlignLeft)
         root.addWidget(self.adv)
 
         self.go = QPushButton()
         self.go.setObjectName("go")
-        self.go.setCursor(Qt.CursorShape.PointingHandCursor)
         self.go.clicked.connect(self._on_go)
         root.addWidget(self.go)
+        
         self.status = self._label("", "dim", True)
         self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(self.status)
-        self.toggle = QPushButton("Alternar geração ON/OFF sem fechar")
-        self.toggle.setObjectName("link")
-        self.toggle.clicked.connect(self.runner.toggle_fg)
-        self.toggle.hide()
-        root.addWidget(self.toggle, alignment=Qt.AlignmentFlag.AlignCenter)
 
     def _on_fsr_changed(self):
         self._update_scale_availability()
+        self._refresh()
 
     def _update_scale_availability(self):
         is_fsr4 = self.rb_fsr4.isChecked()
         self.rb_scale1.setEnabled(is_fsr4)
         self.rb_scale4.setEnabled(is_fsr4)
 
-    # ---------------------------------------------------------- estado
     def _cfg(self):
         target = int(self.cb_target.currentData() or 0)
         fsr_mode = "fsr4" if self.rb_fsr4.isChecked() else "fsr1"
@@ -366,31 +329,9 @@ class Panel(QWidget):
     def _load(self):
         s = self.settings
         self.slider.setValue(s.value("mult", 2, type=int))
-        
-        # Altera o carregamento padrão para 0 (Ilimitado) caso não haja preferência salva
-        target_default = 0 if s.status() == QSettings.Status.AccessError else s.value("target", 0, type=int)
+        target_default = 0
         i = self.cb_target.findData(target_default)
-        self.cb_target.setCurrentIndex(i if i >= 0 else self.cb_target.findData(0))
-        
-        for cb, key, default in ((self.cb_fps, "capture_fps", 30), (self.cb_width, "width", 960),
-                                 (self.cb_mon, "monitor", 0)):
-            i = cb.findData(s.value(key, default, type=int))
-            cb.setCurrentIndex(i if i >= 0 else 0)
-        i = self.cb_fit.findData(s.value("fit", "stretch", type=str))
-        self.cb_fit.setCurrentIndex(i if i >= 0 else 0)
-        
-        fsr_mode = s.value("fsr_mode", "fsr1", type=str)
-        if fsr_mode == "fsr4":
-            self.rb_fsr4.setChecked(True)
-        else:
-            self.rb_fsr1.setChecked(True)
-            
-        scale_factor = s.value("scale_factor", 1, type=int)
-        if scale_factor == 4:
-            self.rb_scale4.setChecked(True)
-        else:
-            self.rb_scale1.setChecked(True)
-        self._update_scale_availability()
+        self.cb_target.setCurrentIndex(i if i >= 0 else 0)
 
     def _save(self):
         c = self._cfg()
@@ -403,18 +344,9 @@ class Panel(QWidget):
         cap, out, lat = rates(c)
         self.val.setText(f"{c['mult']}×")
         self.cap_row.setVisible(c["unlimited"])
-        self.hint.setText("Sem teto: saída = fps do jogo × multiplicador." if c["unlimited"]
-                          else f"Saída fixa em {c['target']} fps: captura = {c['target']} ÷ multiplicador.")
-        warn = "\nCaptura muito baixa: aumente o alvo ou reduza o multiplicador." if cap < 10 else ""
-        screens = QApplication.screens()
-        hz = screens[min(c["monitor"], len(screens) - 1)].refreshRate() if screens else 0
-        if hz and out > hz + 1:
-            warn += f"\nSeu monitor tem {hz:.0f} Hz: acima disso o alvo não aparece na tela."
-        self.info.setText(f"Captura {fmt(cap)} fps  →  saída {fmt(out)} fps  ·  latência ≈ {lat:.0f} ms{warn}")
-        self.folder_lb.setText(f"Pasta: {self.folder}" if self.folder
-                               else "Pasta do framegen não encontrada (onde está el live.py).")
-        if self.phase == "idle" and not self.status.text():
-            self._set_phase("idle")
+        self.hint.setText("Modo Ilimitado Ativo: O FPS de saída escala livremente com o FSR 4." if c["unlimited"]
+                          else f"Saída Fixa em {c['target']} FPS.")
+        self.info.setText(f"Captura {fmt(cap)} FPS  →  Saída Efetiva {fmt(out)} FPS  ·  Latência ≈ {lat:.0f} ms")
         self.adjustSize()
 
     def _toggle_adv(self):
@@ -423,95 +355,50 @@ class Panel(QWidget):
         self.adv_btn.setText("Avançado  ▾" if show else "Avançado  ▸")
         QTimer.singleShot(0, self.adjustSize)
 
-    def _pick_folder(self):
-        d = QFileDialog.getExistingDirectory(self, "Pasta com o live.py", str(self.folder or Path.home()))
-        if not d:
-            return
-        if (Path(d) / "live.py").is_file():
-            self.folder = Path(d)
-            self._save()
-        else:
-            self._set_phase("idle", "Essa pasta não tem o live.py.")
-        self._refresh()
-
     def _set_phase(self, phase, note=""):
         self.phase = phase
         running = phase in ("starting", "running", "stopping")
-        self.box.setEnabled(not running)
-        self.adv_btn.setEnabled(not running)
-        self.adv.setEnabled(not running)
-        self.toggle.setVisible(phase == "running")
-        self.go.setEnabled(phase != "stopping")
-        self.go.setText({"idle": "▶   Iniciar geração de quadros", "starting": "■   Cancelar",
+        self.box_enabled = not running
+        self.go.setText({"idle": "▶   Iniciar Geração de Quadros", "starting": "■   Cancelar",
                          "running": "■   Parar", "stopping": "Encerrando…"}[phase])
-        self.go.setProperty("mode", "stop" if phase in ("starting", "running") else "start")
-        repolish(self.go)
         self.pill.setText({"idle": "Parado", "starting": "Iniciando", "running": "Ativo",
                            "stopping": "Encerrando"}[phase])
         self.pill.setProperty("live", "true" if phase == "running" else "false")
         repolish(self.pill)
-        self.status.setText(note or {
-            "idle": "Os ajustes valem a partir do próximo início.",
-            "starting": "Escolha a janela do jogo no diálogo do sistema…",
-            "running": "Gerando quadros  ·  Ctrl+Alt+F liga/desliga  ·  Ctrl+Alt+N fecha",
-            "stopping": ""}[phase])
+        self.status.setText(note or {"idle": "", "starting": "Iniciando o engine...", "running": "Gerando quadros em alta fluidez", "stopping": ""}[phase])
 
-    # ---------------------------------------------------------- ações
     def _on_go(self):
         if self.phase in ("starting", "running"):
-            self.user_stop, self.stop_deadline = True, time.monotonic() + 5
+            self.user_stop = True
             self.runner.terminate()
             self._set_phase("stopping")
             return
         if not self.folder:
-            self._pick_folder()
+            self.folder = find_folder(Path.cwd())
             if not self.folder:
                 return
         self._save()
-        try:
-            self.runner.start(self.folder, build_args(self._cfg()))
-        except OSError as e:
-            self._set_phase("idle", f"Não foi possível iniciar: {e}")
-            return
-        self.user_stop = False
-        self._set_phase("starting")
+        self.runner.start(self.folder, build_args(self._cfg()))
+        self._set_phase("running")
 
     def _tick(self):
         r = self.runner
         if r.proc is None:
             return
         r.read_log()
-        if r.alive():
-            if self.phase == "stopping" and time.monotonic() > self.stop_deadline:
-                r.kill()
-            elif self.phase == "starting" and r.started_ok():
-                self._set_phase("running")
-            return
-        err = r.last_error()
-        code = r.finish()
-        note = ""
-        if not self.user_stop:
-            note = err or ("" if code in (0, None) else f"O framegen encerrou (código {code}).")
-        self._set_phase("idle", note)
-        self.status.setToolTip(f"Log completo: {LOG}")
+        if not r.alive():
+            self._set_phase("idle")
 
     def closeEvent(self, ev):
-        r = self.runner
-        if r.alive():
-            r.terminate()
-            end = time.monotonic() + 3
-            while r.alive() and time.monotonic() < end:
-                time.sleep(0.05)
-            r.kill()
-            r.finish()
+        if self.runner.alive():
+            self.runner.terminate()
+            self.runner.finish()
         self._save()
         ev.accept()
 
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("Framegen")
-    app.setDesktopFileName("framegen")
     app.setStyle("Fusion")
     app.setPalette(dark_palette())
     app.setStyleSheet(QSS)
