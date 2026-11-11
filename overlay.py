@@ -6,7 +6,9 @@ Modos de upscale (--fsr-mode):
   fsr1   espacial leve: EASU 4x4 + RCAS (16 taps)
   fsr2   espacial + acumulação temporal (TAA com motion vectors do flow)
   fsr3   fsr2 + frame gen (o FG já é ligado por padrão no overlay)
-  dlss1  shim DLSS-like: Pseudo-Depth + TAA Neural-like + Upscale Bilateral + Motion Blur + Sharpen + Saturation
+  dlss1  shim DLSS-like: TAA + Upscale Bilateral 6x6 + Motion Blur + Sharpen + Saturation
+  dlss3  DLSS 3 neural-like: TAA + Lanczos-2 4x4 + Pseudo-Depth + Shadow Lift +
+         Facial Midtone S-Curve + Motion Blur + Grade quente + Sharpening
   fsr4   comportamento antigo (sem temporal, sem upscale pesado)
 
 Atalhos globais (funcionam mesmo com o jogo em foco, sem roubar teclas):
@@ -47,10 +49,7 @@ void main() {
 }
 """
 
-# Passadas que desenham em textura (framebuffer): sem inverter o eixo Y. A linha 0 da textura
-# resultante fica igual à linha 0 do quadro (topo da imagem), a mesma convenção dos quadros enviados
-# pelo numpy. Só a passada final na tela usa VERT (que inverte) para mostrar a imagem de pé.
-# Com VERT em passada de framebuffer a textura sairia de cabeça para baixo e a tela final também.
+# Passadas que desenham em textura (framebuffer): sem inverter o eixo Y.
 VERT_FBO = """#version 330 core
 out vec2 uv;
 void main() {
@@ -135,9 +134,6 @@ void main() {
 }
 """
 
-# =========================================================================
-# TEMPORAL_FRAG CORRIGIDO: TAA estável sem flicker
-# =========================================================================
 TEMPORAL_FRAG = """#version 330 core
 in vec2 uv;
 out vec4 fragColor;
@@ -167,27 +163,14 @@ void main() {
     vec3 ext = 0.5 * (mx - mn) * 1.25;
     hist = clamp(hist, mid - ext, mid + ext);
 
-    // 2. Pseudo-Depth via Detecção de Borda (Apenas para referência, não descarta o histórico)
-    float lc = dot(cur, vec3(0.299, 0.587, 0.114));
-    float ln = dot(texture(texCurrent, uv + vec2(0, -px.y)).rgb, vec3(0.299, 0.587, 0.114));
-    float ls = dot(texture(texCurrent, uv + vec2(0,  px.y)).rgb, vec3(0.299, 0.587, 0.114));
-    float le = dot(texture(texCurrent, uv + vec2(-px.x, 0)).rgb, vec3(0.299, 0.587, 0.114));
-    float lw = dot(texture(texCurrent, uv + vec2( px.x, 0)).rgb, vec3(0.299, 0.587, 0.114));
-    float gx = le - lw;
-    float gy = ln - ls;
-    float gmag = sqrt(gx*gx + gy*gy);
-
-    // 3. Motion Adaptive Blending (Sem edge_factor agressivo para evitar tremedeira)
+    // 2. Motion Adaptive Blending
     float m = clamp(length(flow) / 8.0, 0.0, 1.0);
-    float a = mix(alpha, 0.85, m); // 85% de peso para o quadro atual em alto movimento, alpha para estático.
+    float a = mix(alpha, 0.85, m);
 
     fragColor = vec4(mix(hist, cur, a), 1.0);
 }
 """
 
-# =========================================================================
-# DLSS_FRAG: Upscale Bilateral + Motion Blur + Sharpen + Saturation (Suavizado)
-# =========================================================================
 DLSS_FRAG = """#version 330 core
 in vec2 uv;
 out vec4 fragColor;
@@ -220,7 +203,6 @@ void main() {
     vec3 c_center = T(ip);
     float l_center = L(c_center);
 
-    // 1. Detecção de borda (Sobel 5x5) para direção do Upscale
     float gx = 0.0, gy = 0.0;
     for (int j = -2; j <= 2; j++)
         for (int i = -2; i <= 2; i++) {
@@ -237,7 +219,6 @@ void main() {
     float along = 1.0 - 0.4 * edge_sharp;
     float across = 1.0 + 0.6 * edge_sharp;
 
-    // 2. Upscale Bilateral Lanczos-3 6x6
     vec3 sum = vec3(0.0);
     float wsum = 0.0;
     for (int j = -3; j <= 2; j++)
@@ -249,14 +230,13 @@ void main() {
 
             vec3 s = T(ip + ivec2(i, j));
             float dl = abs(L(s) - l_center);
-            w *= 1.0 / (1.0 + dl * dl * 4.0); // Bilateral weight
+            w *= 1.0 / (1.0 + dl * dl * 4.0);
 
             sum += s * w;
             wsum += w;
         }
     vec3 o = sum / max(wsum, 1e-5);
 
-    // Anti-ringing
     vec3 mn = c_center, mx = c_center;
     for (int j = -1; j <= 1; j++)
         for (int i = -1; i <= 1; i++) {
@@ -266,14 +246,13 @@ void main() {
         }
     o = clamp(o, mn, mx);
 
-    // 3. Motion Blur (baseado no fluxo)
     vec2 flow = texture(texFlow, uv).rg;
     if (blur_strength > 0.0 && length(flow) > 0.5) {
         vec3 blurred = vec3(0.0);
         float bw = 0.0;
         for(int k = 1; k <= 3; k++) {
             float t = float(k) * 0.33;
-            vec2 off = -flow / dstSize * t * blur_strength; 
+            vec2 off = -flow / dstSize * t * blur_strength;
             blurred += texture(tex, uv + off).rgb;
             bw += 1.0;
         }
@@ -281,15 +260,147 @@ void main() {
         o = mix(o, blurred / bw, blur_mix);
     }
 
-    // 4. Sharpening (Unsharp Mask)
     if (sharpness > 0.0) {
         vec3 n = T(ip + ivec2(1,0)) + T(ip + ivec2(-1,0)) + T(ip + ivec2(0,1)) + T(ip + ivec2(0,-1));
         o = o + (o - n * 0.25) * sharpness;
     }
 
-    // 5. Ajuste de Saturação
     float lum = L(o);
     o = mix(vec3(lum), o, saturation);
+
+    fragColor = vec4(clamp(o, 0.0, 1.0), 1.0);
+}
+"""
+
+# =========================================================================
+# DLSS3_FRAG: 9 estágios de pós-processamento "neural-like"
+#  1. Sobel 3x3 (direção da borda)                [era 5x5: 25 -> 9 fetches]
+#  2. Lanczos-2 4x4 bilateral (upscale)           [era Lanczos-3 6x6: 36 -> 16 fetches]
+#  3. Pseudo-depth (contraste local vs centro)
+#  4. Shadow lift (gamma 0.90 + offset)
+#  5. S-curve midtones (expressões faciais)
+#  6. Motion blur (2 taps em vez de 3)
+#  7. Grade quente (era teal-orange — cast azul removido)
+#  8. Unsharp Mask adaptativo
+#  9. Saturação 1.04
+# =========================================================================
+DLSS3_FRAG = """#version 330 core
+in vec2 uv;
+out vec4 fragColor;
+uniform sampler2D tex;
+uniform sampler2D texFlow;
+uniform vec2 srcSize;
+uniform vec2 dstSize;
+
+vec3 T(ivec2 p) { return texelFetch(tex, clamp(p, ivec2(0), ivec2(srcSize) - 1), 0).rgb; }
+float L(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+float sinc(float x) {
+    if (abs(x) < 1e-4) return 1.0;
+    return sin(3.14159265 * x) / (3.14159265 * x);
+}
+float lanczos2(float x) {
+    x = abs(x);
+    if (x >= 2.0) return 0.0;
+    return sinc(x) * sinc(x * 0.5);
+}
+
+void main() {
+    vec2 p  = uv * srcSize - 0.5;
+    ivec2 ip = ivec2(floor(p));
+    vec2  f  = p - vec2(ip);
+
+    vec3 c_center = T(ip);
+    float l_center = L(c_center);
+
+    // ---- 1. Sobel 3x3 (era 5x5: 9 fetches em vez de 25) ----
+    float gx = 0.0, gy = 0.0;
+    for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++) {
+            float l = L(T(ip + ivec2(i, j)));
+            gx += float(i) * l;
+            gy += float(j) * l;
+        }
+    vec2 grad = vec2(gx, gy);
+    float gmag = length(grad);
+    vec2 gdir = gmag > 1e-4 ? grad / gmag : vec2(1.0, 0.0);
+    vec2 perp = vec2(-gdir.y, gdir.x);
+
+    float edge_sharp = clamp(gmag * 4.0, 0.0, 1.0);
+    float along = 1.0 - 0.4 * edge_sharp;
+    float across = 1.0 + 0.6 * edge_sharp;
+
+    // ---- 2. Upscale bilateral Lanczos-2 4x4 (era Lanczos-3 6x6: 16 vs 36) ----
+    vec3 sum = vec3(0.0);
+    float wsum = 0.0;
+    for (int j = -2; j <= 1; j++)
+        for (int i = -2; i <= 1; i++) {
+            vec2 d = vec2(float(i), float(j)) - f;
+            float da = dot(d, gdir) * along;
+            float dp = dot(d, perp) * across;
+            float w = lanczos2(length(vec2(da, dp)));
+
+            vec3 s = T(ip + ivec2(i, j));
+            float dl = abs(L(s) - l_center);
+            w *= 1.0 / (1.0 + dl * dl * 4.0);
+
+            sum += s * w;
+            wsum += w;
+        }
+    vec3 o = sum / max(wsum, 1e-5);
+
+    // Anti-ringing + média 3x3 (reaproveita os mesmos texels)
+    vec3 mn = c_center, mx = c_center, mean3 = c_center;
+    for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++) {
+            if (i == 0 && j == 0) continue;
+            vec3 s = T(ip + ivec2(i, j));
+            mn = min(mn, s);
+            mx = max(mx, s);
+            mean3 += s;
+        }
+    mean3 *= 0.111111;
+    o = clamp(o, mn, mx);
+
+    // ---- 3. Pseudo-depth (contraste local 3x3, sem custo extra) ----
+    float local_contrast = L(mx) - L(mn);
+    float depth_boost = smoothstep(0.03, 0.25, local_contrast) * 0.18;
+    o = o + (o - c_center) * depth_boost;
+
+    // ---- 4. Shadow lift (neutro) ----
+    o = pow(max(o, vec3(0.001)), vec3(0.90));
+    o = o * 1.02 - vec3(0.010);
+
+    // ---- 5. S-curve em midtones (rostos) ----
+    float l_after = L(o);
+    float mid = smoothstep(0.25, 0.75, l_after);
+    float s_curve = mid * (1.0 - mid) * 4.0;
+    o = o + (o - mean3) * s_curve * 0.30;
+
+    // ---- 6. Motion blur (2 taps em vez de 3) ----
+    vec2 flow = texture(texFlow, uv).rg;
+    if (length(flow) > 0.5) {
+        vec3 blurred = texture(tex, uv - flow / dstSize * 0.15).rgb
+                     + texture(tex, uv - flow / dstSize * 0.30).rgb;
+        float blur_mix = clamp(length(flow) / 10.0, 0.0, 0.30);
+        o = mix(o, blurred * 0.5, blur_mix);
+    }
+
+    // ---- 7. Grade quente (era teal-orange, azulado nas sombras) ----
+    // shadow_tint era (-0.015, 0.020, 0.045) -> +0.045 no azul, esse era o cast.
+    float l_final = L(o);
+    vec3 shadow_tint    = vec3(0.008, 0.004,  0.000);
+    vec3 highlight_tint = vec3(0.020, 0.010, -0.005);
+    o = o + mix(shadow_tint, highlight_tint, l_final);
+
+    // ---- 8. Sharpening final (Unsharp Mask adaptativo) ----
+    vec3 n = T(ip + ivec2(1,0)) + T(ip + ivec2(-1,0)) + T(ip + ivec2(0,1)) + T(ip + ivec2(0,-1));
+    float sharpen_amount = 0.30 * (1.0 - edge_sharp * 0.6);
+    o = o + (o - n * 0.25) * sharpen_amount;
+
+    // ---- 9. Saturação sutil ----
+    float lum_final = L(o);
+    o = mix(vec3(lum_final), o, 1.04);
 
     fragColor = vec4(clamp(o, 0.0, 1.0), 1.0);
 }
@@ -316,7 +427,6 @@ float diffAt(vec2 p) {
     return dot(abs(a - b), vec3(1.0 / 3.0));
 }
 void main() {
-    // CORREÇÃO: Usar uv * size em vez de gl_FragCoord.xy para manter consistência top-down
     vec2 p = uv * size;
     vec3 wa, wb;
     warps(p, wa, wb);
@@ -579,8 +689,9 @@ class GLView(QOpenGLWindow):
         self.fsr_mode = fsr_mode
         self.gl_ok = True
         self.interp_ok = False
-        self.temporal_ok = fsr_mode in ("fsr2", "fsr3", "dlss1")
+        self.temporal_ok = fsr_mode in ("fsr2", "fsr3", "dlss1", "dlss3")
         self.dlss_ok = fsr_mode == "dlss1"
+        self.dlss3_ok = fsr_mode == "dlss3"
         self.frames = collections.OrderedDict()
         self.flows = collections.OrderedDict()
         self.fbo = self.fbo_tex = self.fbo_size = None
@@ -626,8 +737,9 @@ class GLView(QOpenGLWindow):
             self.gpu_flag[0] = False
             return
         if not self.gpu_flag[0]:
-            self.temporal_ok = False               # o temporal precisa de framebuffer (GPU)
+            self.temporal_ok = False
             self._init_dlss(GL)
+            self._init_dlss3(GL)
             return
         try:
             self.iprog = self._compile(INTERP_FRAG, VERT_FBO)
@@ -647,6 +759,7 @@ class GLView(QOpenGLWindow):
                 _log(f"{self.fsr_mode} temporal indisponível: {e}; usando FSR 1")
                 self.temporal_ok = False
         self._init_dlss(GL)
+        self._init_dlss3(GL)
 
     def _init_dlss(self, GL):
         if not self.dlss_ok:
@@ -656,7 +769,6 @@ class GLView(QOpenGLWindow):
             self.dloc = {n: GL.glGetUniformLocation(self.dprog, n)
                          for n in ("tex", "texFlow", "srcSize", "dstSize", "sharpness",
                                    "saturation", "blur_strength")}
-            # Textura dummy de fluxo zero para quadros sem fluxo
             self.zero_flow = GL.glGenTextures(1)
             GL.glActiveTexture(GL.GL_TEXTURE0)
             GL.glBindTexture(GL.GL_TEXTURE_2D, self.zero_flow)
@@ -666,6 +778,24 @@ class GLView(QOpenGLWindow):
         except Exception as e:
             _log(f"DLSS 1 indisponível: {e}; usando FSR 1")
             self.dlss_ok = False
+
+    def _init_dlss3(self, GL):
+        if not self.dlss3_ok:
+            return
+        try:
+            self.d3prog = self._compile(DLSS3_FRAG)
+            self.d3loc = {n: GL.glGetUniformLocation(self.d3prog, n)
+                          for n in ("tex", "texFlow", "srcSize", "dstSize")}
+            if self.zero_flow is None:
+                self.zero_flow = GL.glGenTextures(1)
+                GL.glActiveTexture(GL.GL_TEXTURE0)
+                GL.glBindTexture(GL.GL_TEXTURE_2D, self.zero_flow)
+                self._tex_params(GL, GL.GL_NEAREST)
+                GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RG16F, 1, 1, 0, GL.GL_RG, GL.GL_FLOAT,
+                                np.zeros((1, 1, 2), dtype=np.float32))
+        except Exception as e:
+            _log(f"DLSS 3 indisponível: {e}; usando FSR 1")
+            self.dlss3_ok = False
 
     def _tex_params(self, GL, filt):
         for k, v in ((GL.GL_TEXTURE_MIN_FILTER, filt), (GL.GL_TEXTURE_MAG_FILTER, filt),
@@ -793,7 +923,7 @@ class GLView(QOpenGLWindow):
             GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
             GL.glUniform1i(self.tloc[name], unit)
         GL.glUniform2f(self.tloc["size"], float(w), float(h))
-        GL.glUniform1f(self.tloc["alpha"], 0.25) # Aumentado de 0.15 para 0.25 para maior estabilidade
+        GL.glUniform1f(self.tloc["alpha"], 0.20)
         GL.glBindVertexArray(self.vao)
         GL.glDrawArrays(GL.GL_TRIANGLES, 0, 3)
         GL.glBindVertexArray(0)
@@ -842,7 +972,6 @@ class GLView(QOpenGLWindow):
         GL = self.GL
         frame, on, flow = feed.cur
 
-        # Se for quadro gerado (GenRef), usa o shader de interpolação padrão
         if isinstance(frame, GenRef):
             h, w = frame.shape[:2]
             tex = None
@@ -857,9 +986,7 @@ class GLView(QOpenGLWindow):
             if tex is None:
                 frame = frame.render()
                 h, w = frame.shape[:2]
-            flow = None # Quadro gerado não tem fluxo
-
-        # Se for quadro original e modo temporal (fsr2/fsr3/dlss1)
+            flow = None
         elif self.temporal_ok and flow is not None:
             h, w = frame.shape[:2]
             tex = self._temporal_accumulate(frame, flow)
@@ -888,28 +1015,35 @@ class GLView(QOpenGLWindow):
         x, y, vw, vh = _fit(w, h, W, H)
         GL.glViewport(x, y, vw, vh)
 
-        use_dlss = self.dlss_ok and self.fsr_mode == "dlss1" and not isinstance(frame, GenRef)
-        
-        if use_dlss:
+        is_gen = isinstance(frame, GenRef)
+        use_dlss3 = self.dlss3_ok and not is_gen
+        use_dlss1 = self.dlss_ok and not is_gen and not use_dlss3
+
+        if use_dlss3:
+            GL.glUseProgram(self.d3prog)
+            GL.glActiveTexture(GL.GL_TEXTURE0)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
+            GL.glUniform1i(self.d3loc["tex"], 0)
+            GL.glActiveTexture(GL.GL_TEXTURE1)
+            flow_tex = self._flow_tex(flow) if flow is not None else self.zero_flow
+            GL.glBindTexture(GL.GL_TEXTURE_2D, flow_tex)
+            GL.glUniform1i(self.d3loc["texFlow"], 1)
+            GL.glUniform2f(self.d3loc["srcSize"], float(w), float(h))
+            GL.glUniform2f(self.d3loc["dstSize"], float(vw), float(vh))
+        elif use_dlss1:
             GL.glUseProgram(self.dprog)
             GL.glActiveTexture(GL.GL_TEXTURE0)
             GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
             GL.glUniform1i(self.dloc["tex"], 0)
-            
             GL.glActiveTexture(GL.GL_TEXTURE1)
-            if flow is not None:
-                flow_tex = self._flow_tex(flow)
-            else:
-                flow_tex = self.zero_flow
+            flow_tex = self._flow_tex(flow) if flow is not None else self.zero_flow
             GL.glBindTexture(GL.GL_TEXTURE_2D, flow_tex)
             GL.glUniform1i(self.dloc["texFlow"], 1)
-            
             GL.glUniform2f(self.dloc["srcSize"], float(w), float(h))
             GL.glUniform2f(self.dloc["dstSize"], float(vw), float(vh))
-            # Parâmetros suavizados para evitar tremedeira
-            GL.glUniform1f(self.dloc["sharpness"], 0.4)    # Reduzido de 0.6 para 0.4
-            GL.glUniform1f(self.dloc["saturation"], 1.1)   # Reduzido de 1.15 para 1.1
-            GL.glUniform1f(self.dloc["blur_strength"], 0.5) # Reduzido de 0.8 para 0.5
+            GL.glUniform1f(self.dloc["sharpness"], 0.4)
+            GL.glUniform1f(self.dloc["saturation"], 1.1)
+            GL.glUniform1f(self.dloc["blur_strength"], 0.5)
         else:
             GL.glUseProgram(self.prog)
             GL.glActiveTexture(GL.GL_TEXTURE0)

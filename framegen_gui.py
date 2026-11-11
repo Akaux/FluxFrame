@@ -29,16 +29,36 @@ FSR_MODES = (
      "FSR 2 + frame gen (que já é ligado por padrão no overlay). Recomendado."),
     ("dlss1", "DLSS 1 — GPU-heavy",
      "Temporal + bilateral 6×6 + Sobel (144 reads/px). Alivia a CPU, pesa na GPU."),
+    ("dlss3", "DLSS 3 — Neural-like (cinematográfico)",
+     "TAA + Lanczos-2 4×4 + Pseudo-Depth + Shadow Lift + Midtone S-Curve (rostos) + Grade quente + Sharpening adaptativo."),
     ("fsr4",  "FSR 4 — Escala ×N (legado)",
      "Modo antigo: multiplica o fator de quadros por --scale-factor (1x/4x)."),
 )
+
+# NOVO: estimadores de flow disponíveis no live.py
+FLOW_OPTS = (
+    ("farneback",    "Farneback (qualidade)",
+     "Melhor precisão do flow. ~12 ms a 320x180."),
+    ("dis-medium",   "DIS Medium",
+     "DIS médio. ~4.5 ms a 320x180."),
+    ("dis-fast",     "DIS Fast (~7×)",
+     "DIS rápido. ~1.6 ms a 320x180."),
+    ("dis-ultrafast","DIS Ultrafast (~24×)",
+     "DIS ultrafast. ~0.5 ms a 320x180."),
+)
+
+# NOVO: valores do slider de --scale (0 = qualidade, N = mais rápido)
+SCALE_VALUES = (0.25, 0.22, 0.20, 0.18, 0.16, 0.15, 0.13, 0.12)
 
 
 def build_args(cfg):
     args = ["--screen", "--overlay", "--mult", str(cfg["mult"]),
             "--width", str(cfg["width"]), "--output", str(cfg["monitor"]),
             "--fit", cfg["fit"], "--fsr-mode", cfg["fsr_mode"],
-            "--scale-factor", str(cfg["scale_factor"])]
+            "--scale-factor", str(cfg["scale_factor"]),
+            # NOVO: escala do flow e estimador
+            "--scale", str(cfg["scale"]),
+            "--flow", cfg["flow"]]
     if cfg.get("window"):
         args += ["--window", cfg["window"]]
     if cfg["unlimited"]:
@@ -133,6 +153,7 @@ QLabel#title {{ font-size: 20px; font-weight: 700; }}
 QLabel#dim {{ color: {DIM}; }}
 QLabel#section {{ color: {DIM}; font-size: 11px; font-weight: 600; }}
 QLabel#value {{ color: {ACCENT}; font-size: 24px; font-weight: 700; }}
+QLabel#valueSm {{ color: {ACCENT}; font-size: 16px; font-weight: 700; }}
 QLabel#pill {{ background: {CARD}; border: 1px solid {EDGE}; border-radius: 10px;
                padding: 3px 11px; color: {DIM}; font-size: 12px; }}
 QLabel#pill[live="true"] {{ background: {ACCENT}; border-color: {ACCENT}; color: #0f1014; }}
@@ -223,10 +244,10 @@ class Panel(QWidget):
         cl.addWidget(self.slider)
         root.addWidget(card)
 
-        # ---------------- FSR / DLSS (COMBO com as 5 opções)
+        # ---------------- FSR / DLSS
         card_fsr = QFrame(); card_fsr.setObjectName("card")
         cf_l = QVBoxLayout(card_fsr); cf_l.setContentsMargins(16, 14, 16, 16); cf_l.setSpacing(10)
-        cf_l.addWidget(self._label("UPSCALER (FSR 1/2/3/4 e DLSS 1)", "section"))
+        cf_l.addWidget(self._label("UPSCALER (FSR 1/2/3/4 e DLSS 1/3)", "section"))
 
         self.cb_fsr = QComboBox()
         for val, label, _tip in FSR_MODES:
@@ -237,7 +258,6 @@ class Panel(QWidget):
         self.fsr_hint = self._label("", "dim", True)
         cf_l.addWidget(self.fsr_hint)
 
-        # Escala de fluidez: SÓ existe no modo FSR 4 (legado).
         scale_row = QHBoxLayout()
         scale_row.addWidget(self._label("Escala de fluidez (FSR 4):"))
         self.rb_scale1 = QRadioButton("1x (padrão)")
@@ -249,6 +269,43 @@ class Panel(QWidget):
         scale_row.addWidget(self.rb_scale4)
         cf_l.addLayout(scale_row)
         root.addWidget(card_fsr)
+
+        # ---------------- NOVO: FLUXO (motion vectors)
+        card_flow = QFrame(); card_flow.setObjectName("card")
+        cfl = QVBoxLayout(card_flow); cfl.setContentsMargins(16, 14, 16, 16); cfl.setSpacing(10)
+        cfl.addWidget(self._label("FLUXO (motion vectors)", "section"))
+
+        # slider --scale
+        row = QHBoxLayout()
+        row.addWidget(self._label("Escala do flow"))
+        row.addStretch()
+        self.lbl_scale = self._label("0.25", "valueSm")
+        row.addWidget(self.lbl_scale)
+        cfl.addLayout(row)
+        self.slider_scale = QSlider(Qt.Orientation.Horizontal)
+        self.slider_scale.setRange(0, len(SCALE_VALUES) - 1)
+        self.slider_scale.setPageStep(1)
+        self.slider_scale.setValue(0)
+        self.slider_scale.valueChanged.connect(self._on_scale_changed)
+        cfl.addWidget(self.slider_scale)
+
+        # combo --flow
+        row2 = QHBoxLayout()
+        row2.addWidget(self._label("Estimador"))
+        row2.addStretch()
+        self.cb_flow = QComboBox()
+        for val, lbl, _tip in FLOW_OPTS:
+            self.cb_flow.addItem(lbl, val)
+        self.cb_flow.currentIndexChanged.connect(self._on_flow_changed)
+        row2.addWidget(self.cb_flow)
+        cfl.addLayout(row2)
+
+        self.flow_hint = self._label("", "dim", True)
+        cfl.addWidget(self.flow_hint)
+
+        self.flow_effect = self._label("", "dim", True)
+        cfl.addWidget(self.flow_effect)
+        root.addWidget(card_flow)
 
         # ---------------- FPS alvo
         card2 = QFrame(); card2.setObjectName("card")
@@ -320,10 +377,10 @@ class Panel(QWidget):
 
         # Todos os widgets existem: agora é seguro consultar _cfg() via _refresh().
         self._on_fsr_changed()
+        self._on_flow_changed()
 
     # ------------------------------------------------------------------ FSR/DLSS
     def _on_fsr_changed(self, *_):
-        """Chamado quando o combo de FSR muda. Habilita a escala só no FSR 4 e atualiza o hint."""
         mode = self.cb_fsr.currentData() or "fsr1"
         is_fsr4 = (mode == "fsr4")
         self.rb_scale1.setEnabled(is_fsr4)
@@ -331,6 +388,28 @@ class Panel(QWidget):
         hint = next((h for v, _, h in FSR_MODES if v == mode), "")
         self.fsr_hint.setText(hint)
         self._refresh()
+
+    # NOVO: handlers do flow
+    def _on_scale_changed(self, v):
+        self.lbl_scale.setText(f"{SCALE_VALUES[v]:.2f}")
+        self._refresh()
+
+    def _on_flow_changed(self, *_):
+        mode = self.cb_flow.currentData() or "farneback"
+        hint = next((h for v, _, h in FLOW_OPTS if v == mode), "")
+        self.flow_hint.setText(hint)
+        self._update_flow_effect()
+        self._refresh()
+
+    def _update_flow_effect(self):
+        scale = SCALE_VALUES[self.slider_scale.value()]
+        rel = (scale / 0.25) ** 2 * 100  # custo relativo aproximado vs 0.25
+        self.flow_effect.setText(
+            f"Custo de flow ≈ {rel:.0f}% do padrão (0.25). "
+            "Reduza até o HUD mostrar 'proc' bem abaixo do orçamento.")
+        self.flow_effect.setToolTip(
+            "O flow roda a cada quadro, mesmo com FG OFF em modos temporais. "
+            "Se 'proc' no HUD já está bem abaixo do orçamento, baixar mais não ganha FPS.")
 
     def _cfg(self):
         target = int(self.cb_target.currentData() or 0)
@@ -344,7 +423,9 @@ class Panel(QWidget):
                     monitor=int(self.cb_mon.currentData() or 0),
                     fit=str(self.cb_fit.currentData() or "stretch"),
                     window=self.ed_window.text().strip(),
-                    fsr_mode=fsr_mode, scale_factor=scale_factor)
+                    fsr_mode=fsr_mode, scale_factor=scale_factor,
+                    scale=SCALE_VALUES[self.slider_scale.value()],
+                    flow=str(self.cb_flow.currentData() or "farneback"))
 
     def _load(self):
         s = self.settings
@@ -357,6 +438,17 @@ class Panel(QWidget):
         i = self.cb_fsr.findData(saved_fsr)
         if i >= 0:
             self.cb_fsr.setCurrentIndex(i)
+        # NOVO: carrega flow scale + estimador
+        scale_saved = s.value("scale", "0.25", type=str)
+        try:
+            idx = SCALE_VALUES.index(float(scale_saved))
+        except (ValueError, TypeError):
+            idx = 0
+        self.slider_scale.setValue(idx)
+        flow_saved = s.value("flow", "farneback", type=str)
+        i = self.cb_flow.findData(flow_saved)
+        if i >= 0:
+            self.cb_flow.setCurrentIndex(i)
 
     def _save(self):
         c = self._cfg()

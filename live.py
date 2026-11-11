@@ -58,6 +58,7 @@ Exemplos:
   python live.py --screen --overlay --mult 2 --width auto --window "Meu Jogo"
   python live.py --screen --overlay --width 960 --fsr-mode fsr2         # temporal
   python live.py --screen --overlay --width 960 --fsr-mode dlss1        # GPU-heavy
+  python live.py --screen --overlay --width 960 --fsr-mode dlss3        # Neural-like cinematográfico
 """
 import argparse
 import collections
@@ -374,11 +375,12 @@ def main():
                    help="limite da largura de processamento no modo --width auto")
     p.add_argument("--window", metavar="TEXTO",
                    help="overlay: só considera janelas cujo título ou classe contém TEXTO")
-    p.add_argument("--fsr-mode", choices=("fsr1", "fsr2", "fsr3", "fsr4", "dlss1"), default="fsr1",
+    p.add_argument("--fsr-mode", choices=("fsr1", "fsr2", "fsr3", "fsr4", "dlss1", "dlss3"), default="fsr1",
                    help="upscaling quality: fsr1 (leve, espacial), fsr2 (acumulação temporal com "
                         "motion vectors do flow), fsr3 (fsr2 + frame gen; o FG já é ligado por "
                         "padrão no overlay), fsr4 (comportamento antigo com --scale-factor N), "
-                        "dlss1 (GPU-heavy: 6x6 bilateral Lanczos-3 + Sobel, alivia a CPU)")
+                        "dlss1 (GPU-heavy: 6x6 bilateral Lanczos-3 + Sobel, alivia a CPU), "
+                        "dlss3 (Neural-like: Pseudo-Depth + Shadow Lift + Teal-Orange Grade)")
     p.add_argument("--scale-factor", type=int, default=1, help="ver --fsr-mode fsr4")
     p.add_argument("--scale", type=float, default=0.25, help="escala máxima do cálculo do flow")
     p.add_argument("--no-auto", action="store_true", help="desliga a qualidade adaptativa")
@@ -419,7 +421,7 @@ def main():
 
     sf = args.scale_factor if (args.fsr_mode == "fsr4" and args.scale_factor > 1) else 1
     total_mult = args.mult * sf if args.mult else None
-    needs_temporal = args.fsr_mode in ("fsr2", "fsr3", "dlss1")
+    needs_temporal = args.fsr_mode in ("fsr2", "fsr3", "dlss1", "dlss3")
 
     args.width_auto = str(args.width).strip().lower() == "auto"
     if args.width_auto:
@@ -445,8 +447,8 @@ def main():
     if needs_temporal:
         print(f"fsr_mode={args.fsr_mode}: acumulação temporal ativa "
               "(o flow é calculado mesmo com FG OFF).")
-    if args.fsr_mode == "dlss1":
-        print("dlss1: shader GPU-heavy ativo — o gargalo migra da CPU para a GPU.")
+    if args.fsr_mode in ("dlss1", "dlss3"):
+        print(f"{args.fsr_mode}: shader GPU-heavy ativo — o gargalo migra da CPU para a GPU.")
 
     bench = Bench(args.bench_log)
     src = Source(args, bench)
