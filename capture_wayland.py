@@ -27,6 +27,7 @@ class PortalCapture:
         # cursor oculto (o cursor real do sistema fica por cima do overlay, sem atraso).
         self.overlay = overlay
         self._frame = None
+        self._seq = 0                              # quadros REAIS recebidos do PipeWire (taxa do jogo)
         self._lock = threading.Lock()
         self._n = itertools.count(1)
         self.pipeline = None
@@ -120,12 +121,19 @@ class PortalCapture:
                 buf.unmap(info)
             with self._lock:
                 self._frame = frame
+                self._seq += 1
         return Gst.FlowReturn.OK
 
     def latest(self):
         """Último quadro recebido (o Wayland só envia quando a tela muda)."""
         with self._lock:
             return self._frame
+
+    def latest_with_seq(self):
+        """(último quadro, contador de quadros reais). O contador só sobe quando o jogo entrega
+        um quadro novo; o live.py usa isso para medir o fps real e pular quadros repetidos."""
+        with self._lock:
+            return self._frame, self._seq
 
     def stop(self):
         if self.pipeline is not None:
@@ -134,7 +142,8 @@ class PortalCapture:
 
 if __name__ == "__main__":
     # Processo filho: fala com o portal e envia quadros BGR pelo stdout.
-    # Protocolo por quadro: '<II' (largura, altura) + largura*altura*3 bytes.
+    # Protocolo por quadro: '<IIQ' (largura, altura, contador de quadros reais do jogo)
+    # + largura*altura*3 bytes.
     # Roda separado do visualizador para o GLib/GStreamer não conflitar com o Qt do OpenCV.
     import argparse
     import struct
@@ -158,14 +167,14 @@ if __name__ == "__main__":
         while True:
             nxt += period
             time.sleep(max(0.0, nxt - time.perf_counter()))
-            f = cap.latest()                      # taxa constante: repete o último quadro
+            f, seq = cap.latest_with_seq()        # taxa constante: repete o último quadro
             if f is None:
                 continue
             if first:
                 first = False
                 print(f"Primeiro quadro: {f.shape[1]}x{f.shape[0]}, brilho médio {f.mean():.1f}"
                       " (0 = preto)", file=sys.stderr)
-            out.write(struct.pack("<II", f.shape[1], f.shape[0]))
+            out.write(struct.pack("<IIQ", f.shape[1], f.shape[0], seq))
             out.write(f.tobytes())
             out.flush()
     except (BrokenPipeError, KeyboardInterrupt):

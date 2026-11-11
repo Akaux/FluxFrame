@@ -135,11 +135,12 @@ void main() {
 
 # --------------------------------------------------------------- fila / prazo
 class Feed:
-    """Recebe (hora_de_exibir, quadro, fg_on) do agendador e escolhe o quadro de cada vsync."""
+    """Recebe (hora_de_exibir, quadro, fg_on) do agendador e escolhe o quadro de cada vsync.
+    `present(agora, fg_on)` é chamado a cada quadro único que vai para a tela (benchmark)."""
     MAX_BUF = 24
 
-    def __init__(self, q, st, shown, hud_lines, hud_on, refresh):
-        self.q, self.st, self.shown = q, st, shown
+    def __init__(self, q, st, present, hud_lines, hud_on, refresh):
+        self.q, self.st, self.present = q, st, present
         self.hud_lines, self.hud_on = hud_lines, hud_on
         self.period = 1.0 / refresh
         self.lead = 0.5 * self.period          # um quadro que vence antes do próximo vsync já serve
@@ -170,7 +171,7 @@ class Feed:
             if now - when > self.period:
                 self.st["late"] += 1
             self.st["shown"] += 1
-            self.shown.append(now)
+            self.present(now, on)
             self.cur, self.new = (frame, on), True
         return now
 
@@ -180,9 +181,16 @@ class Feed:
         return self.hud_lines(now, self.cur[1])
 
 
+FIT_MODE = "fit"      # "fit" = barras pretas | "stretch" = preenche (deforma) | "crop" = preenche (corta)
+
+
 def _fit(w, h, W, H):
-    """Retângulo (x, y, largura, altura) que encaixa w x h em W x H mantendo a proporção."""
-    s = min(W / w, H / h)
+    """Retângulo (x, y, largura, altura) onde a imagem w x h é desenhada na janela W x H.
+    fit: mantém a proporção (barras pretas); stretch: ocupa tudo, deformando se as proporções
+    diferem; crop: ocupa tudo mantendo a proporção, cortando o que passa das bordas."""
+    if FIT_MODE == "stretch":
+        return 0, 0, W, H
+    s = max(W / w, H / h) if FIT_MODE == "crop" else min(W / w, H / h)
     vw, vh = max(1, int(w * s)), max(1, int(h * s))
     return (W - vw) // 2, (H - vh) // 2, vw, vh
 
@@ -396,9 +404,11 @@ class SoftView(QRasterWindow):
 
 
 # --------------------------------------------------------------------- main
-def run_overlay(q, size, st, shown, hud_lines, hud_on, on_fg, *, output=0, geometry=None,
-                soft=False, managed=False, sharpness=0.2, seconds=0):
+def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geometry=None,
+                soft=False, managed=False, sharpness=0.2, seconds=0, fit="fit"):
     """Abre o overlay e bloqueia até sair. `q` é a fila (hora, quadro, fg) do live.py."""
+    global FIT_MODE
+    FIT_MODE = fit
     fmt = QSurfaceFormat()
     fmt.setVersion(3, 3)
     fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
@@ -416,7 +426,7 @@ def run_overlay(q, size, st, shown, hud_lines, hud_on, on_fg, *, output=0, geome
         g = scr.geometry()
         x, y, w, h = g.x(), g.y(), g.width(), g.height()
 
-    feed = Feed(q, st, shown, hud_lines, hud_on, refresh)
+    feed = Feed(q, st, present, hud_lines, hud_on, refresh)
     view = SoftView(feed, refresh) if soft else GLView(
         feed, 0.0 if sharpness < 0 else 2.0 ** -sharpness)
     view.setTitle("framegen-overlay")

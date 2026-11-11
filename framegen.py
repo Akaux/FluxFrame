@@ -13,6 +13,7 @@ Exemplos:
   python framegen.py upscale meu_video.mp4 saida.mp4 --factor 2
 """
 import argparse
+import threading
 import time
 
 import cv2
@@ -30,15 +31,54 @@ def small_gray(img, scale=0.5):
     return g
 
 
+FLOW_METHODS = ("dis-ultrafast", "dis-fast", "dis-medium", "farneback")
+_flow_method = "farneback"        # padrão: melhor qualidade medida (DIS é opcional via --flow)
+_tls = threading.local()          # DISOpticalFlow não é thread-safe: uma instância por thread
+
+
+def set_flow_method(name):
+    """Escolhe o estimador de movimento. DIS é ~7x mais rápido que Farneback (a 320x180:
+    0,5 / 1,6 / 4,5 ms contra ~12 ms), mas na cena de teste perdeu 6-7 dB de PSNR; sem DIS no OpenCV instalado, cai para Farneback."""
+    global _flow_method
+    if name not in FLOW_METHODS:
+        raise ValueError(f"método de flow inválido: {name}")
+    if name.startswith("dis") and not hasattr(cv2, "DISOpticalFlow"):
+        print("OpenCV sem DISOpticalFlow; usando Farneback.")
+        name = "farneback"
+    _flow_method = name
+    return name
+
+
+def get_flow_method():
+    return _flow_method
+
+
+def _dis_instance(name):
+    cached = getattr(_tls, "dis", None)
+    if cached is None or cached[0] != name:
+        preset = {"dis-ultrafast": cv2.DISOPTICAL_FLOW_PRESET_ULTRAFAST,
+                  "dis-fast": cv2.DISOPTICAL_FLOW_PRESET_FAST,
+                  "dis-medium": cv2.DISOPTICAL_FLOW_PRESET_MEDIUM}[name]
+        cached = (name, cv2.DISOpticalFlow.create(preset))
+        _tls.dis = cached
+    return cached[1]
+
+
+def _raw_flow(ga, gb):
+    if _flow_method == "farneback":
+        return cv2.calcOpticalFlowFarneback(
+            ga, gb, None,
+            pyr_scale=0.5, levels=5, winsize=11, iterations=3,
+            poly_n=5, poly_sigma=1.1, flags=0)
+    return _dis_instance(_flow_method).calc(ga, gb, None)
+
+
 def flow_from_gray(ga, gb, scale=0.5, full_size=None):
-    """Farneback entre dois cinzas já reduzidos. O resultado vem em PIXELS DO QUADRO FINAL.
+    """Fluxo óptico entre dois cinzas já reduzidos (DIS por padrão, ou Farneback).
+    O resultado vem em PIXELS DO QUADRO FINAL.
     full_size=(w, h) reescala o campo para tela cheia; None devolve o campo pequeno
     (a GPU amostra com filtro bilinear, então não precisa do resize)."""
-    flow = cv2.calcOpticalFlowFarneback(
-        ga, gb, None,
-        pyr_scale=0.5, levels=5, winsize=11, iterations=3,
-        poly_n=5, poly_sigma=1.1, flags=0,
-    )
+    flow = _raw_flow(ga, gb)
     # Zona morta (em baixa resolução, barato): movimentos < ~0.5px do quadro final
     # são ruído do estimador; aplicá-los só borra a imagem.
     fx, fy = cv2.split(flow)
@@ -62,11 +102,14 @@ _GRIDS = {}
 
 
 def _grid(h, w):
+    """Grade de coordenadas (x, y) intercalada em 2 canais float32: permite montar o mapa
+    do remap com UMA operação (scaleAdd) em vez de split + 2 scaleAdd + 2 mapas."""
     g = _GRIDS.get((h, w))
     if g is None:
         if len(_GRIDS) > 4:
             _GRIDS.clear()
-        g = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+        gx, gy = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+        g = cv2.merge([gx, gy])
         _GRIDS[(h, w)] = g
     return g
 
@@ -75,11 +118,8 @@ def warp(img, flow, t):
     """Reposiciona pixels: o pixel q da saída busca sua cor em q - t*flow(q).
     (backward warping: evita buracos, ao contrário de empurrar pixels para frente)."""
     h, w = flow.shape[:2]
-    gx, gy = _grid(h, w)
-    fx, fy = cv2.split(flow)
-    map_x = cv2.scaleAdd(fx, -t, gx)                 # gx - t*fx
-    map_y = cv2.scaleAdd(fy, -t, gy)
-    return cv2.remap(img, map_x, map_y, cv2.INTER_LINEAR,
+    maps = cv2.scaleAdd(flow, -t, _grid(h, w))        # grade - t*flow
+    return cv2.remap(img, maps, None, cv2.INTER_LINEAR,
                      borderMode=cv2.BORDER_REPLICATE)
 
 
@@ -238,15 +278,19 @@ def main():
     e.add_argument("--step", type=int, default=1)
     e.add_argument("--scale", type=float, default=0.5)
     e.add_argument("--max-frames", type=int, default=300)
+    e.add_argument("--flow", choices=FLOW_METHODS, default=None)
     e.set_defaults(fn=cmd_eval)
 
     u = sub.add_parser("upscale"); u.add_argument("input"); u.add_argument("output")
     u.add_argument("--factor", type=int, default=2)
     u.add_argument("--scale", type=float, default=0.5)
     u.add_argument("--max-frames", type=int, default=None)
+    u.add_argument("--flow", choices=FLOW_METHODS, default=None)
     u.set_defaults(fn=cmd_upscale)
 
     args = p.parse_args()
+    if getattr(args, "flow", None):
+        set_flow_method(args.flow)
     args.fn(args)
 
 
