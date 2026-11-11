@@ -9,12 +9,10 @@ Modos de upscale (--fsr-mode):
   dlss1  temporal + upscale bilateral 6x6 + Sobel (GPU-heavy)
   fsr4   comportamento antigo (sem temporal, sem upscale pesado)
 
-Regra:
-- Se `follow_size=True` (padrão do painel em modo "Automático"), o overlay assume
-  exatamente a geometria da janela do jogo e a segue se ela for movida ou redimensionada.
-- Sem `follow_size` (ex.: `--geometry` explícito), cobre o `geometry` ou o monitor inteiro.
-- `mask=True` (`--mask`) bypassa o WM; nesse caso o overlay sempre cobre o monitor e
-  Alt+Tab fica travado.
+Atalhos globais (funcionam mesmo com o jogo em foco, sem roubar teclas):
+  Ctrl+Alt+F  pausa/retoma a geração de quadros
+  Ctrl+Alt+H  mostra/esconde o HUD
+  Ctrl+Alt+N  ou  Ctrl+Alt+Q  fecha o programa
 """
 import collections
 import ctypes
@@ -416,6 +414,97 @@ def keep_click_through(view):
     timer.timeout.connect(lambda: set_click_through(view.winId()))
     timer.start(1500)
     view._click_timer = timer
+
+
+class X11Hotkeys:
+    """Atalhos globais nativos via X11 (XGrabKey), funcionam no jogo sem precisar de evdev."""
+    def __init__(self, on_fg, on_hud, on_quit):
+        self.on_fg = on_fg
+        self.on_hud = on_hud
+        self.on_quit = on_quit
+        self.dpy = None
+        self.root = None
+        self.keycodes = {}
+        self.timer = None
+        try:
+            x11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+            x11.XOpenDisplay.restype = ctypes.c_void_p
+            x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            x11.XDefaultRootWindow.restype = ctypes.c_ulong
+            x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+            x11.XKeysymToKeycode.restype = ctypes.c_ubyte
+            x11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            x11.XGrabKey.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.c_ulong, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            x11.XUngrabKey.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.c_ulong]
+            x11.XPending.argtypes = [ctypes.c_void_p]
+            x11.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            x11.XFlush.argtypes = [ctypes.c_void_p]
+            x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+
+            self._err_handler = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)(lambda d, e: 0)
+            x11.XSetErrorHandler(ctypes.cast(self._err_handler, ctypes.c_void_p))
+
+            self.dpy = x11.XOpenDisplay(None)
+            if not self.dpy:
+                _log("X11Hotkeys: não foi possível abrir o display X11 (atalhos desativados).")
+                return
+            self.x11 = x11
+            self.root = x11.XDefaultRootWindow(self.dpy)
+
+            ControlMask = 1 << 2
+            Mod1Mask = 1 << 3
+            modifiers = ControlMask | Mod1Mask
+
+            # keysyms: 'f'=0x66, 'h'=0x68, 'n'=0x6e, 'q'=0x71
+            self.keysyms = {
+                0x66: self.on_fg,
+                0x68: self.on_hud,
+                0x6e: self.on_quit,
+                0x71: self.on_quit,
+            }
+            for keysym, action in self.keysyms.items():
+                keycode = x11.XKeysymToKeycode(self.dpy, keysym)
+                if keycode:
+                    self.keycodes[keycode] = action
+                    x11.XGrabKey(self.dpy, keycode, modifiers, self.root, 0, 1, 1)
+            x11.XFlush(self.dpy)
+
+            self.timer = QTimer()
+            self.timer.timeout.connect(self.poll)
+            self.timer.start(50)
+            _log("Atalhos globais X11 ativos: Ctrl+Alt+F (Pausar FG), Ctrl+Alt+H (HUD), Ctrl+Alt+N/Q (Sair)")
+        except Exception as e:
+            _log(f"X11Hotkeys: falha ao configurar atalhos ({e}).")
+
+    def poll(self):
+        if not self.dpy:
+            return
+        try:
+            while self.x11.XPending(self.dpy):
+                event = ctypes.create_string_buffer(192)
+                self.x11.XNextEvent(self.dpy, event)
+                if event.raw[0] == 2:  # KeyPress
+                    keycode = event.raw[84]
+                    if keycode in self.keycodes:
+                        self.keycodes[keycode]()
+        except Exception:
+            pass
+
+    def stop(self):
+        if self.dpy:
+            try:
+                if self.timer:
+                    self.timer.stop()
+                ControlMask = 1 << 2
+                Mod1Mask = 1 << 3
+                modifiers = ControlMask | Mod1Mask
+                for keycode in self.keycodes:
+                    self.x11.XUngrabKey(self.dpy, keycode, modifiers, self.root)
+                self.x11.XFlush(self.dpy)
+                self.x11.XCloseDisplay(self.dpy)
+            except Exception:
+                pass
+            self.dpy = None
 
 
 class GLView(QOpenGLWindow):
@@ -855,11 +944,19 @@ def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geo
     if seconds:
         QTimer.singleShot(int(seconds * 1000), app.quit)
 
+    # Atalhos globais via X11 nativo
+    hotkeys = X11Hotkeys(
+        on_fg=on_fg,
+        on_hud=lambda: hud_on.__setitem__(0, not hud_on[0]),
+        on_quit=app.quit
+    )
+
     _log("entrando no event loop")
     try:
         app.exec()
     finally:
         _log("saindo do event loop")
+        hotkeys.stop()
         pump.stop()
         follow_timer.stop()
         view.close()
