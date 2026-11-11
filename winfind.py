@@ -204,6 +204,13 @@ class XConn:
             w, _kids = self.tree(w)
         return ids
 
+    def is_active(self, w):
+        """True se `w` é a janela ativa (tem o foco do teclado). False se não é ou se não há foco."""
+        v = self.prop(self.root, "_NET_ACTIVE_WINDOW", 1)
+        if isinstance(v, list) and v and v[0]:
+            return v[0] == w
+        return False
+
     # ------------------------------------------------------------ janelas
     def geometry(self, w):
         """('ok', (x, y, largura, altura)) | ('hidden', None) minimizada/oculta | ('gone', None)."""
@@ -312,6 +319,15 @@ class WindowTracker:
         self.ever_found = False
         self.geo = None
         self._next_pick = 0.0
+        self._was_hidden = False        # só para logar a transição uma vez
+
+    def is_active(self):
+        """True se a janela alvo é a janela ativa (tem foco). Usado como fallback quando o WM
+        não respeita o setTransientForHint e o overlay precisa se esconder sozinho."""
+        if self.win is None:
+            return False
+        with self.conn.quiet():
+            return self.conn.is_active(self.win)
 
     def poll(self, now):
         geo = None
@@ -321,6 +337,15 @@ class WindowTracker:
                 if state == "gone":
                     self.log("winfind: a janela alvo foi fechada; procurando de novo...")
                     self.win = None
+                elif state == "hidden":
+                    if not self._was_hidden:
+                        self.log("winfind: janela alvo minimizada/em outro workspace")
+                        self._was_hidden = True
+                    geo = None
+                else:
+                    if self._was_hidden:
+                        self.log("winfind: janela alvo restaurada")
+                        self._was_hidden = False
             if self.win is None and now >= self._next_pick:
                 self._next_pick = now + self.retry
                 w = pick(self.conn.candidates(self.exclude), self.aspect, self.text)

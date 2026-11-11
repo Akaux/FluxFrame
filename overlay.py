@@ -245,6 +245,31 @@ def set_click_through(win_id):
         return False
 
 
+def set_transient_for(overlay_id, parent_id):
+    """Marca o overlay como janela-filha (transient) da janela do jogo: o WM
+    minimiza/mostra o overlay junto com o jogo, sem que o overlay fique 'órfão'."""
+    import ctypes
+    import ctypes.util
+    try:
+        x11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XSetTransientForHint.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong]
+        x11.XFlush.argtypes = [ctypes.c_void_p]
+        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        dpy = x11.XOpenDisplay(None)
+        if not dpy:
+            return False
+        try:
+            x11.XSetTransientForHint(dpy, int(overlay_id), int(parent_id))
+            x11.XFlush(dpy)
+        finally:
+            x11.XCloseDisplay(dpy)
+        return True
+    except Exception:
+        return False
+
+
 def keep_click_through(view):
     set_click_through(view.winId())
     timer = QTimer(view)
@@ -264,7 +289,7 @@ class GLView(QOpenGLWindow):
         self.flows = collections.OrderedDict()
         self.fbo = self.fbo_tex = self.fbo_size = None
         self.last = 0.0
-        
+
         tick = QTimer(self)
         tick.setTimerType(Qt.TimerType.PreciseTimer)
         tick.timeout.connect(self._pump)
@@ -459,15 +484,20 @@ class GLView(QOpenGLWindow):
     def changeEvent(self, event):
         if event.type() == QEvent.Type.ActivationChange:
             if not self.isActiveWindow():
-                QGuiApplication.quit()           # (quitOnLastWindowClosed está desligado)
+                QGuiApplication.quit()
         super().changeEvent(event)
 
 
 def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geometry=None,
-                soft=False, managed=False, sharpness=0.2, seconds=0, fit="auto",
-                gpu_interp=None, tracker=None):
-    """`tracker` (winfind.WindowTracker) faz o overlay assumir a posição e o tamanho da janela do
-    app e segui-la; sem ele (ou se o app não for achado) cobre `geometry` ou o monitor inteiro."""
+                soft=False, managed=False, mask=False, sharpness=0.2, seconds=0, fit="auto",
+                gpu_interp=None, tracker=None, follow_size=False):
+    """Comportamento do overlay:
+     - `mask=True`: MÁSCARA fullscreen override-redirect (X11BypassWindowManagerHint).
+       Fica acima de TUDO (inclusive Alt+Tab); o follow() tenta esconder quando o jogo perde foco.
+     - `mask=False` (padrão): janela Tool WM-gerenciada COM 'sempre no topo' (WindowStaysOnTopHint).
+       O WM consegue minimizar/Alt+Tab e o follow() esconde quando o jogo minimiza ou fica
+       >1s inativo. Com `follow_size=True` e `set_transient_for` (do live.py), o WM trata o
+       overlay como diálogo do jogo: minimiza junto, mostra junto."""
     global FIT_MODE
     FIT_MODE = fit
     fmt = QSurfaceFormat()
@@ -477,7 +507,7 @@ def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geo
     QSurfaceFormat.setDefaultFormat(fmt)
 
     app = QGuiApplication(["framegen-overlay"])
-    app.setQuitOnLastWindowClosed(False)   # esconder o overlay (app minimizado) não pode encerrar
+    app.setQuitOnLastWindowClosed(False)
     screens = app.screens()
     scr = screens[min(max(output, 0), len(screens) - 1)]
     track_geo = None
@@ -487,7 +517,7 @@ def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geo
         except Exception as e:
             print(f"overlay: acompanhamento da janela indisponível ({e})")
             tracker = None
-    if track_geo:
+    if follow_size and track_geo:
         x, y, w, h = track_geo
         scr = app.screenAt(QPoint(x + w // 2, y + h // 2)) or scr
     elif geometry:
@@ -495,7 +525,7 @@ def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geo
     else:
         g = scr.geometry()
         x, y, w, h = g.x(), g.y(), g.width(), g.height()
-        if tracker is not None:
+        if tracker is not None and follow_size:
             print("overlay: janela do app não encontrada; cobrindo o monitor até achá-la "
                   "(apps Wayland nativos não são detectáveis: use --geometry x,y,l,a)")
     refresh = scr.refreshRate() or 60.0
@@ -507,14 +537,19 @@ def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geo
     view = GLView(feed, 0.0 if sharpness < 0 else 2.0 ** -sharpness, gpu)
     view.setTitle("framegen-overlay")
     view.setScreen(scr)
-    
-    flags = (Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
-             | Qt.WindowType.WindowTransparentForInput | Qt.WindowType.WindowDoesNotAcceptFocus)
-    if managed:
-        flags |= Qt.WindowType.Tool
-    else:
+
+    # Flags:
+    #  - Por padrão: Tool + StaysOnTop, SEM X11Bypass (WM gerencia normalmente).
+    #  - --managed: idem ao padrão (compat).
+    #  - --mask: adiciona X11Bypass (comportamento antigo). Alt+Tab quebra.
+    flags = (Qt.WindowType.FramelessWindowHint
+             | Qt.WindowType.WindowTransparentForInput
+             | Qt.WindowType.WindowDoesNotAcceptFocus
+             | Qt.WindowType.WindowStaysOnTopHint
+             | Qt.WindowType.Tool)
+    if mask:
         flags |= Qt.WindowType.X11BypassWindowManagerHint
-        
+
     view.setFlags(flags)
     view.setGeometry(x, y, w, h)
     view.show()
@@ -523,25 +558,49 @@ def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geo
 
     cur_geo = [(x, y, w, h)]
 
+    def reparent(parent_id):
+        if parent_id is None:
+            return False
+        ok = set_transient_for(view.winId(), parent_id)
+        if not ok:
+            print("overlay: set_transient_for falhou (uso apenas o polling)")
+        return ok
+
+    if tracker is not None and tracker.win is not None:
+        reparent(tracker.win)
+
+    # follow(): esconde o overlay quando o jogo minimiza OU perde o foco por >1s (Alt+Tab).
+    # Mostra de novo quando o jogo volta a ficar visível/ativo. Se follow_size=True, também
+    # acompanha a geometria da janela.
+    last_active = [time.perf_counter()]
+    inactive_hide_after = 1.0
+
     def follow():
-        """Mantém o overlay exatamente sobre a janela do app: move, redimensiona e esconde
-        quando ela é minimizada ou fechada."""
         try:
             geo = tracker.poll(time.perf_counter())
         except Exception as e:
             print(f"overlay: acompanhamento da janela desligado ({e})")
             follow_timer.stop()
             return
-        if geo is None:
+        now = time.perf_counter()
+        active = tracker.is_active() if tracker.win else True
+        if active:
+            last_active[0] = now
+        inactive_too_long = (not active) and (now - last_active[0] > inactive_hide_after)
+        if geo is None or inactive_too_long:
             if tracker.ever_found and view.isVisible():
                 view.hide()
             return
         if not view.isVisible():
             view.show()
             set_click_through(view.winId())
-        if geo != cur_geo[0]:
+            if tracker.win is not None:
+                reparent(tracker.win)
+        if follow_size and geo != cur_geo[0]:
             view.setGeometry(*geo)
             cur_geo[0] = geo
+            if tracker.win is not None:
+                reparent(tracker.win)
 
     follow_timer = QTimer()
     if tracker is not None:
@@ -552,7 +611,7 @@ def run_overlay(q, size, st, present, hud_lines, hud_on, on_fg, *, output=0, geo
     signal.signal(signal.SIGUSR2, lambda *_: hud_on.__setitem__(0, not hud_on[0]))
     signal.signal(signal.SIGINT, lambda *_: app.quit())
     signal.signal(signal.SIGTERM, lambda *_: app.quit())
-    
+
     pump = QTimer()
     pump.timeout.connect(feed.drain)
     pump.start(100)

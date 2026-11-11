@@ -19,11 +19,18 @@ Os atalhos globais usam evdev (pip install evdev; usuário no grupo input).
 Detalhes visuais e click-through em overlay.py.
 
 Resolução automática (--width auto, padrão do painel): o overlay assume a posição e o tamanho
-da JANELA do app (e a segue se for movida, redimensionada ou minimizada) em vez de cobrir o
-monitor, e o processamento usa a largura dela (no máximo --auto-max-width, p.ex. 1280, porque o
-fluxo óptico roda na CPU). A janela é achada via X11/XWayland (jogos Proton/Wine, apps X11); apps
-Wayland nativos não são visíveis: use --geometry x,y,l,a. Se achar a janela errada, force com
+da JANELA do app (e a segue se for movida ou redimensionada) em vez de cobrir o monitor, e o
+processamento usa a largura dela (no máximo --auto-max-width, p.ex. 1280, porque o fluxo óptico
+roda na CPU). A janela é achada via X11/XWayland (jogos Proton/Wine, apps X11); apps Wayland
+nativos não são visíveis: use --geometry x,y,l,a. Se achar a janela errada, force com
 --window "parte do título ou da classe".
+
+Minimizar: o overlay é uma janela WM-gerenciada (Tool) marcada como `transient_for` a janela
+do jogo. O WM minimiza/mostra o overlay junto com o jogo. Um polling de fallback esconde o
+overlay se a janela do jogo for minimizada/oculta ou perder o foco por >1s. Alt+Tab para outro
+app esconde o overlay; ao voltar ao jogo, ele reaparece. Se o app for Wayland nativo (não-
+XWayland) o tracker não vê a janela — nesse caso use --geometry (o overlay cobre a região e
+não some ao minimizar).
 
 Benchmark (HUD e resumo ao sair):
   JOGO   fps real do jogo (quadros únicos entregues, antes do FG)
@@ -99,10 +106,10 @@ class Source(threading.Thread):
         super().__init__(daemon=True)
         self.args = args
         self.bench = bench
-        self._uniq = 0          # contador de quadros distintos (vídeo/mss); no portal vem do PipeWire
+        self._uniq = 0
         self._thumb = None
         self.cond = threading.Condition()
-        self.latest = None      # (frame, timestamp, uid)
+        self.latest = None
         self.id = 0
         self.dropped = 0
         self.ended = False
@@ -125,8 +132,6 @@ class Source(threading.Thread):
         return f
 
     def _next_uid(self, f):
-        """Identificador do conteúdo: só muda quando o quadro é realmente diferente do anterior
-        (miniatura 48x27). Vídeo e mss repetem quadros; o portal já traz o contador pronto."""
         t = cv2.resize(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY), (48, 27), interpolation=cv2.INTER_AREA)
         if self._thumb is None or cv2.absdiff(t, self._thumb).mean() > 0.25:
             self._uniq += 1
@@ -161,15 +166,15 @@ class Source(threading.Thread):
     def run(self):
         try:
             self._run()
-        except Exception as e:                       # erro de captura: avisa e encerra
+        except Exception as e:
             print(f"\nErro na captura: {e}")
             with self.cond:
                 self.ended = True
                 self.cond.notify_all()
-            self.ready.set()                         # libera a espera do 1º quadro
+            self.ready.set()
 
     def _use_portal(self):
-        if self.args.overlay:                        # só o portal captura uma janela sem pegar o overlay
+        if self.args.overlay:
             return True
         return os.environ.get("XDG_SESSION_TYPE") == "wayland" and not self.args.x11
 
@@ -180,7 +185,7 @@ class Source(threading.Thread):
             cap = cv2.VideoCapture(self.args.video)
             while not self.ended:
                 ok, f = cap.read()
-                if not ok:                           # fim: volta ao começo
+                if not ok:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
                 nxt += period
@@ -229,11 +234,9 @@ class Source(threading.Thread):
 
 # --------------------------------------------------------------- main
 def resolve_width(args):
-    """--width auto: largura da janela do app, limitada por --auto-max-width (o cálculo é na CPU;
-    o shader do overlay amplia de volta até o tamanho da janela). Devolve a largura em pixels."""
     cap = args.auto_max_width
     if not (args.screen and args.overlay):
-        return cap                                   # sem janela para medir (vídeo, mss...)
+        return cap
     w = winfind.find_once(text=args.window)
     if w is None:
         print(f"auto: janela do app não encontrada agora; processando em {cap} px "
@@ -252,14 +255,8 @@ def sleep_until(t):
         pass
 
 
-
 class GlobalHotkeys:
-    """Escuta atalhos globais sem consumir os eventos do teclado.
-
-    O evdev lê os eventos diretamente dos dispositivos de entrada; não usa grab(),
-    portanto Ctrl+Alt+F/H/N também continua chegando ao jogo/aplicativo em foco.
-    Em Wayland, o acesso normalmente exige evdev instalado e permissão ao /dev/input.
-    """
+    """Escuta atalhos globais sem consumir os eventos do teclado."""
 
     def __init__(self, on_fg, on_hud, on_quit):
         self.on_fg = on_fg
@@ -301,7 +298,6 @@ class GlobalHotkeys:
         warned_no_device = False
         try:
             while not self.stop_event.is_set():
-                # Detecta teclados conectados depois da inicialização também.
                 for path in evdev.list_devices():
                     if path in devices:
                         continue
@@ -344,10 +340,10 @@ class GlobalHotkeys:
                     for event in events:
                         if event.type != ecodes.EV_KEY:
                             continue
-                        if event.value == 0:  # soltou
+                        if event.value == 0:
                             held.discard(event.code)
                             continue
-                        if event.value != 1:  # ignora repetição automática
+                        if event.value != 1:
                             continue
                         held.add(event.code)
                         if held.intersection(ctrl_codes) and held.intersection(alt_codes):
@@ -360,6 +356,7 @@ class GlobalHotkeys:
                     dev.close()
                 except OSError:
                     pass
+
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
@@ -403,7 +400,15 @@ def main():
                         "proporção (barras pretas); crop = preenche cortando as bordas")
     p.add_argument("--soft", action="store_true", help="overlay sem OpenGL (QPainter, mais lento)")
     p.add_argument("--managed", action="store_true",
-                   help="overlay como janela normal (sem override-redirect), se o seu WM reclamar")
+                   help="overlay WM-gerenciado COM 'sempre no topo' (adicione se o overlay ficar "
+                        "atrás do jogo; ainda permite minimizar/Alt+Tab)")
+    p.add_argument("--mask", action="store_true",
+                   help="overlay como MÁSCARA fullscreen override-redirect (X11BypassWindowManagerHint): "
+                        "fica acima de TUDO, inclusive do Alt+Tab — ÚLTIMO RECURSO. Combine com "
+                        "--no-global-hotkeys só se souber sair pelo terminal (pkill -TERM -f live.py)")
+    p.add_argument("--no-follow", action="store_true",
+                   help="NÃO seguir a janela do jogo: cobre o monitor inteiro sem esconder ao "
+                        "minimizar (comportamento antigo; combine com --geometry)")
     p.add_argument("--no-global-hotkeys", action="store_true",
                    help="desativa os atalhos globais Ctrl+Alt+F/H/N (modo overlay)")
     p.add_argument("--seconds", type=float, default=0, help="duração (0 = até fechar)")
@@ -417,7 +422,7 @@ def main():
                    help="grava uma linha por segundo (fps do jogo, saída, 1%% low...)")
     args = p.parse_args()
     sf = args.scale_factor if (args.fsr_mode == "fsr4" and args.scale_factor > 1) else 1
-    total_mult = args.mult * sf if args.mult else None      # fator real de quadros (igual ao painel)
+    total_mult = args.mult * sf if args.mult else None
     if not args.fps or args.fps <= 0:
         args.fps = args.target_fps / total_mult if (total_mult and args.target_fps > 0) else 30.0
     args.width_auto = str(args.width).strip().lower() == "auto"
@@ -445,16 +450,25 @@ def main():
         return
     interval = 1.0 / src.fps
     factor = total_mult or max(1, round(args.target_fps / src.fps))
-    L = 2 * interval - interval / factor          # latência fixa (orçamento = 1 quadro de origem)
+    L = 2 * interval - interval / factor
     canvas_w, canvas_h = src.size
 
-    gpu_interp = [bool(args.overlay and not args.soft)]    # o overlay desliga se o shader falhar
+    gpu_interp = [bool(args.overlay and not args.soft)]
+
+    # Tracker de janela: criado SEMPRE no modo overlay (exceto --geometry / --no-follow).
+    # Serve para: (a) seguir a janela do jogo (follow_size=True em modo auto/window);
+    # (b) esconder o overlay quando o jogo minimiza ou perde o foco (fallback do overlay.py).
+    # Com --mask o overlay é uma máscara fullscreen override-redirect e o WM não a gerencia;
+    # nesse caso só o polling do follow() consegue escondê-la (250 ms de atraso).
     tracker = None
-    if args.overlay and not args.geometry and (args.width_auto or args.window):
+    follow_size = False
+    if args.overlay and not args.geometry and not args.no_follow:
         try:
             tracker = winfind.WindowTracker(aspect=src.size[0] / src.size[1], text=args.window)
+            follow_size = True
         except winfind.WinFindError as e:
-            print(f"auto: não consigo acompanhar a janela do app ({e}); cobrindo o monitor.")
+            print(f"overlay: não consigo acompanhar a janela do app ({e}); "
+                  "cobrindo o monitor e usando --mask como fallback.")
 
     fg_on = [True]
     hud_on = [True]
@@ -462,12 +476,10 @@ def main():
     proc_ms = collections.deque(maxlen=60)
     st = dict(late=0, skipped=0, stale=0, errors=0, shown=0, dup=0)
     pool = ThreadPoolExecutor(2)
-    q = queue.Queue()                             # fila de saída: (hora_de_exibir, quadro, fg)
+    q = queue.Queue()
     stop = threading.Event()
     start = time.perf_counter()
 
-    # Os sinais permitem controlar o FrameGen mesmo quando o jogo está em foco.
-    # O evdev abaixo oferece os mesmos comandos por teclado, sem roubar o foco.
     def toggle_fg():
         fg_on[0] = not fg_on[0]
         bench.set_fg(fg_on[0])
@@ -482,7 +494,6 @@ def main():
         with src.cond:
             src.ended = True
             src.cond.notify_all()
-        # SIGINT interrompe também o event loop Qt do overlay e executa o finally.
         os.kill(os.getpid(), signal.SIGINT)
 
     if hasattr(signal, "SIGUSR1"):
@@ -496,29 +507,21 @@ def main():
         hotkeys.start()
 
     def processor():
-        """Gera os quadros intermediários e agenda a exibição.
-
-        O jogo pode entregar menos quadros que a captura (que repete o último a taxa fixa).
-        Quadro repetido é ignorado: não há movimento novo e calcular fluxo entre duas cópias
-        iguais só gasta CPU que o jogo precisa. O espaço entre dois quadros únicos (gap) vira
-        n = gap/intervalo * fator partes, e cada quadro gerado é agendado dentro desse espaço:
-          mid_k em t_prev + L + k*gap/n   (com gap = intervalo: t_cap + L - I + k*I/fator)"""
         last_id = 0
         prev = prev_uid = prev_t = None
         while prev is None and not stop.is_set():
             prev, prev_t, last_id, prev_uid = src.get(last_id)
-        pg = None                                  # (cinza reduzido de prev, escala) reaproveitado
+        pg = None
         adapt_n = 0
         while not stop.is_set():
             cur, t_cap, last_id, uid = src.get(last_id)
             if cur is None:
                 continue
-            if uid == prev_uid:                    # o jogo não entregou quadro novo
+            if uid == prev_uid:
                 st["dup"] += 1
                 continue
-            gap = t_cap - prev_t                   # tempo real entre os dois quadros únicos
+            gap = t_cap - prev_t
             n = int(round(gap / interval * factor))
-            # janela redimensionada: entre tamanhos diferentes não há o que interpolar
             if (fg_on[0] and factor > 1 and n > 1 and gap <= 3.2 * interval
                     and prev.shape == cur.shape):
                 try:
@@ -528,8 +531,6 @@ def main():
                         pg = (small_gray(prev, sc), sc)
                     gc = small_gray(cur, sc)
                     gpu = gpu_interp[0]
-                    # GPU: o fluxo fica pequeno e o shader do overlay faz warp e mistura
-                    # (zero CPU de remap); CPU: amplia o fluxo e interpola aqui.
                     size = None if gpu else (cur.shape[1], cur.shape[0])
                     f_fw = pool.submit(flow_from_gray, pg[0], gc, sc, size)
                     f_bw = pool.submit(flow_from_gray, gc, pg[0], sc, size)
@@ -537,7 +538,7 @@ def main():
                     for k in range(1, n):
                         when = prev_t + L + k * gap / n
                         if time.perf_counter() > when + 0.002:
-                            st["skipped"] += 1             # já passou da hora: não adianta gerar
+                            st["skipped"] += 1
                             continue
                         if gpu:
                             q.put((when, GenRef(prev, cur, fw, bw, k / n), True))
@@ -551,7 +552,6 @@ def main():
                     st["errors"] += 1
                     if st["errors"] <= 3:
                         print(f"Erro ao gerar quadro: {e}")
-                # qualidade adaptativa: mantém o cálculo dentro do orçamento
                 adapt_n += 1
                 if not args.no_auto and adapt_n >= 8 and len(proc_ms) >= 8:
                     avg = sum(list(proc_ms)[-8:]) / 8
@@ -567,7 +567,6 @@ def main():
             q.put((t_cap + L, cur, fg_on[0]))
             prev, prev_uid, prev_t = cur, uid, t_cap
 
-    # ------------------------------------------------ janela
     zoom = [args.window_scale]
     fullscreen = [False]
     win_wh = [0, 0]
@@ -603,12 +602,12 @@ def main():
         bench.present(now, label_on)
         if args.headless:
             return -1
-        if st["shown"] % 15 == 1:                       # tamanho atual da janela
+        if st["shown"] % 15 == 1:
             _, _, ww, wh = cv2.getWindowImageRect(WIN)
             win_wh[:] = [ww, wh]
         view = frame
         if win_wh[0] > 0 and win_wh[1] > 0:
-            view = letterbox(frame, win_wh[0], win_wh[1])   # mantém a proporção ao redimensionar
+            view = letterbox(frame, win_wh[0], win_wh[1])
         if hud_on[0]:
             view = view.copy()
             for i, txt in enumerate(hud_lines(now, label_on)):
@@ -630,7 +629,7 @@ def main():
                 return
             apply_zoom()
             win_wh[:] = [0, 0]
-            st["shown"] = 0                              # força reler o tamanho da janela
+            st["shown"] = 0
         elif key in (ord("z"), ord("Z")):
             fullscreen[0] = not fullscreen[0]
             cv2.setWindowProperty(WIN, cv2.WND_PROP_FULLSCREEN,
@@ -643,13 +642,12 @@ def main():
             args.scale = max(args.scale, qscale[0]) if args.no_auto else args.scale
         elif key == ord("]"):
             qscale[0] = min(0.6, qscale[0] + 0.05)
-            args.scale = max(args.scale, qscale[0])      # o ajuste manual vira o novo teto
+            args.scale = max(args.scale, qscale[0])
 
     proc_thread = threading.Thread(target=processor, daemon=True)
     proc_thread.start()
 
     def bench_loop():
-        """Uma linha por segundo: CSV (--bench-log) e, no modo headless, status no terminal."""
         while not stop.wait(1.0):
             now = time.perf_counter()
             avg = float(np.mean(proc_ms)) if proc_ms else 0.0
@@ -671,7 +669,7 @@ def main():
                     break
                 continue
             now = time.perf_counter()
-            if now - when > interval:                    # muito velho: descarta em vez de acumular
+            if now - when > interval:
                 st["stale"] += 1
                 continue
             if now > when + 0.004:
@@ -685,11 +683,13 @@ def main():
 
     try:
         if args.overlay:
-            from overlay import run_overlay          # Qt no thread principal; o resto roda nos threads
+            from overlay import run_overlay
             run_overlay(q, src.size, st, bench.present, hud_lines, hud_on, toggle_fg,
                         output=args.output, geometry=args.geometry, soft=args.soft,
-                        managed=args.managed, sharpness=args.sharpness, seconds=args.seconds,
-                        fit=args.fit, gpu_interp=gpu_interp, tracker=tracker)
+                        managed=args.managed, mask=args.mask,
+                        sharpness=args.sharpness, seconds=args.seconds,
+                        fit=args.fit, gpu_interp=gpu_interp, tracker=tracker,
+                        follow_size=follow_size)
         else:
             window_loop()
     except KeyboardInterrupt:
@@ -702,7 +702,7 @@ def main():
         with src.cond:
             src.ended = True
             src.cond.notify_all()
-        proc_thread.join(3)                      # espera as threads terminarem antes de sair
+        proc_thread.join(3)
         src.join(3)
         pool.shutdown(wait=True)
         if not args.headless and not args.overlay:
