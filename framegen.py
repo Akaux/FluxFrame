@@ -27,7 +27,7 @@ def estimate_flow(a, b, scale=0.5):
     gb = cv2.cvtColor(b, cv2.COLOR_BGR2GRAY)
     h, w = ga.shape
     if scale != 1.0:
-        size = (int(w * scale), int(h * scale))
+        size = (max(8, int(w * scale)), max(8, int(h * scale)))
         ga = cv2.resize(ga, size, interpolation=cv2.INTER_AREA)
         gb = cv2.resize(gb, size, interpolation=cv2.INTER_AREA)
     flow = cv2.calcOpticalFlowFarneback(
@@ -35,23 +35,39 @@ def estimate_flow(a, b, scale=0.5):
         pyr_scale=0.5, levels=5, winsize=11, iterations=3,
         poly_n=5, poly_sigma=1.1, flags=0,
     )
+    # Zona morta (em baixa resolução, barato): movimentos < ~0.5px do quadro final
+    # são ruído do estimador; aplicá-los só borra a imagem.
+    fx, fy = cv2.split(flow)
+    mag = cv2.magnitude(fx, fy)
+    gain = np.clip((mag - 0.4 * scale) / (0.6 * scale), 0.0, 1.0)
+    flow = flow * (gain[..., None] / scale)          # já converte para pixels do quadro final
     if scale != 1.0:
-        flow = cv2.resize(flow, (w, h), interpolation=cv2.INTER_LINEAR) / scale
-    # Zona morta: movimentos < ~0.5px são ruído do estimador; aplicá-los só borra a imagem.
-    mag = np.linalg.norm(flow, axis=2, keepdims=True)
-    flow = flow * np.clip((mag - 0.4) / 0.6, 0.0, 1.0)
+        flow = cv2.resize(flow, (w, h), interpolation=cv2.INTER_LINEAR)
     return flow
 
 
 # ----------------------------------------------------------------- warping
+_GRIDS = {}
+
+
+def _grid(h, w):
+    g = _GRIDS.get((h, w))
+    if g is None:
+        if len(_GRIDS) > 4:
+            _GRIDS.clear()
+        g = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+        _GRIDS[(h, w)] = g
+    return g
+
+
 def warp(img, flow, t):
     """Reposiciona pixels: o pixel q da saída busca sua cor em q - t*flow(q).
     (backward warping: evita buracos, ao contrário de empurrar pixels para frente)."""
     h, w = flow.shape[:2]
-    gx, gy = np.meshgrid(np.arange(w, dtype=np.float32),
-                         np.arange(h, dtype=np.float32))
-    map_x = gx - t * flow[..., 0]
-    map_y = gy - t * flow[..., 1]
+    gx, gy = _grid(h, w)
+    fx, fy = cv2.split(flow)
+    map_x = cv2.scaleAdd(fx, -t, gx)                 # gx - t*fx
+    map_y = cv2.scaleAdd(fy, -t, gy)
     return cv2.remap(img, map_x, map_y, cv2.INTER_LINEAR,
                      borderMode=cv2.BORDER_REPLICATE)
 
@@ -69,7 +85,7 @@ def interpolate(a, b, t, flow_fw=None, flow_bw=None, occ_thresh=18.0, scale=0.5)
     2. warp de A por t e de B por (1-t)
     3. onde os dois warps discordam, o pixel provavelmente é oclusão/erro:
        usa só o quadro temporalmente mais próximo
-    Retorna (quadro, máscara_de_oclusão float 0..1).
+    Retorna (quadro, máscara_de_oclusão uint8 0..255).
     """
     if flow_fw is None:
         flow_fw = estimate_flow(a, b, scale)
@@ -78,15 +94,25 @@ def interpolate(a, b, t, flow_fw=None, flow_bw=None, occ_thresh=18.0, scale=0.5)
 
     wa = warp(a, flow_fw, t)
     wb = warp(b, flow_bw, 1.0 - t)
+    mixed = cv2.addWeighted(wa, 1.0 - t, wb, t, 0)
 
-    diff = np.abs(wa.astype(np.float32) - wb.astype(np.float32)).mean(axis=2)
-    diff = cv2.GaussianBlur(diff, (0, 0), 3)
-    occ = np.clip((diff - occ_thresh) / occ_thresh, 0.0, 1.0)[..., None]
+    # Oclusão calculada em 1/4 da resolução (o mapa é suave de qualquer jeito)
+    h, w = wa.shape[:2]
+    small = (max(1, w // 4), max(1, h // 4))
+    da = cv2.resize(wa, small, interpolation=cv2.INTER_AREA)
+    db = cv2.resize(wb, small, interpolation=cv2.INTER_AREA)
+    diff = cv2.absdiff(da, db).astype(np.float32).mean(axis=2)
+    diff = cv2.GaussianBlur(diff, (0, 0), 0.8)
+    occ = np.clip((diff - occ_thresh) / occ_thresh, 0.0, 1.0)
+    mask = cv2.resize((occ * 255).astype(np.uint8), (w, h), interpolation=cv2.INTER_LINEAR)
+    if not mask.any():
+        return mixed, mask
 
-    mixed = (1.0 - t) * wa.astype(np.float32) + t * wb.astype(np.float32)
-    nearest = (wa if t < 0.5 else wb).astype(np.float32)
-    out = mixed * (1.0 - occ) + nearest * occ
-    return np.clip(out, 0, 255).astype(np.uint8), occ[..., 0]
+    nearest = wa if t < 0.5 else wb
+    m3 = cv2.merge([mask, mask, mask])
+    out = cv2.add(cv2.multiply(mixed, cv2.bitwise_not(m3), scale=1 / 255.0),
+                  cv2.multiply(nearest, m3, scale=1 / 255.0))
+    return out, mask
 
 
 def generate_between(a, b, n_new, **kw):
@@ -167,7 +193,7 @@ def cmd_eval(args):
     print(f"Ganho médio:            {np.mean(scores_m) - np.mean(scores_b):+.2f} dB")
     print(f"Tempo por quadro (CPU): {np.mean(times) * 1000:.0f} ms")
     _, a, b, gt, mid, occ = best
-    occ_img = cv2.cvtColor((occ * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+    occ_img = cv2.cvtColor(occ, cv2.COLOR_GRAY2BGR)
     row1 = np.hstack([blend(a, b, 0.5), mid])
     row2 = np.hstack([gt, occ_img])
     cv2.imwrite("comparacao.png", np.vstack([row1, row2]))

@@ -3,34 +3,58 @@
 Visualizador de Frame Generation em tempo real (CPU).
 
 Fontes:
-  --video arquivo.mp4     reproduz o vídeo em tempo real (funciona em qualquer sessão)
+  --video arquivo.mp4     reproduz o vídeo em tempo real
   --screen                captura a tela (Wayland: portal + PipeWire; X11: mss)
 
-Teclas na janela:  F = liga/desliga a geração de quadros   Q/Esc = sair
+FPS: a fonte roda em --fps e o programa gera quadros extras até chegar perto de
+--target-fps (60 por padrão).  --fps 30 -> x2 | --fps 20 -> x3 | --fps 15 -> x4.
+Se o cálculo não cabe no tempo, a qualidade do flow cai sozinha (use --no-auto para desligar).
+
+Teclas (a janela framegen precisa estar em foco):
+  F  liga/desliga a geração de quadros     H  mostra/esconde o HUD
+  +/-  aumenta/diminui a janela            0  volta ao tamanho original
+  Z  tela cheia                            [ ]  menos/mais qualidade do flow
+  Q ou Esc  sai
 
 Exemplos:
   python live.py --video demo.mp4
-  python live.py --video gameplay.mp4 --width 960 --scale 0.25
-  python live.py --screen --fps 30              # Wayland: escolha a tela/janela no diálogo
-  python live.py --screen --x11 --region 0,0,1280,720   # força mss (só X11)
+  python live.py --screen --fps 30 --width 720
+  python live.py --screen --fps 20 --target-fps 60
 """
 import argparse
+import collections
 import os
+import queue
+import sys
+import threading
+import time
 
 # O OpenCV traz Qt sem plugin Wayland: usa XWayland para a janela e evita avisos.
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts")
-import collections
-import queue
-import threading
-import time
+
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
 
-from concurrent.futures import ThreadPoolExecutor
-
 from framegen import interpolate, estimate_flow
+
+WIN = "framegen"
+
+
+def letterbox(img, w, h):
+    """Encaixa a imagem em w x h mantendo a proporção (barras pretas nas sobras)."""
+    ih, iw = img.shape[:2]
+    if (iw, ih) == (w, h):
+        return img
+    s = min(w / iw, h / ih)
+    nw, nh = max(1, int(iw * s)), max(1, int(ih * s))
+    r = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
+    canvas = np.zeros((h, w, 3), np.uint8)
+    y0, x0 = (h - nh) // 2, (w - nw) // 2
+    canvas[y0:y0 + nh, x0:x0 + nw] = r
+    return canvas
 
 
 # ------------------------------------------------------------ fontes
@@ -71,7 +95,8 @@ class Source(threading.Thread):
             self.latest = (f, time.perf_counter())
             self.id += 1
             self._consumed = False
-            self.size = f.shape[1::-1]
+            if self.size is None:
+                self.size = f.shape[1::-1]
             self.cond.notify_all()
         self.ready.set()
 
@@ -104,7 +129,7 @@ class Source(threading.Thread):
             cap = cv2.VideoCapture(self.args.video)
             while not self.ended:
                 ok, f = cap.read()
-                if not ok:                       # fim: volta ao começo
+                if not ok:                           # fim: volta ao começo
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
                 nxt += period
@@ -113,7 +138,6 @@ class Source(threading.Thread):
         elif self._use_portal():
             import struct
             import subprocess
-            import sys
             here = os.path.dirname(os.path.abspath(__file__))
             proc = subprocess.Popen(
                 [sys.executable, os.path.join(here, "capture_wayland.py"),
@@ -166,12 +190,15 @@ def main():
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--video")
     g.add_argument("--screen", action="store_true")
-    p.add_argument("--region", help="x,y,largura,altura (use com --screen)")
+    p.add_argument("--region", help="x,y,largura,altura (só com --screen --x11)")
     p.add_argument("--x11", action="store_true", help="força o mss mesmo no Wayland")
     p.add_argument("--monitor", type=int, default=1)
     p.add_argument("--fps", type=float, default=30.0, help="FPS de captura (--screen)")
+    p.add_argument("--target-fps", type=float, default=60.0, help="FPS de saída desejado")
     p.add_argument("--width", type=int, default=960, help="reduz a largura antes de processar")
-    p.add_argument("--scale", type=float, default=0.25, help="escala do cálculo do flow")
+    p.add_argument("--scale", type=float, default=0.25, help="escala máxima do cálculo do flow")
+    p.add_argument("--no-auto", action="store_true", help="desliga a qualidade adaptativa")
+    p.add_argument("--window-scale", type=float, default=1.0, help="zoom inicial da janela")
     p.add_argument("--headless", action="store_true", help="sem janela (só estatísticas)")
     p.add_argument("--seconds", type=float, default=0, help="duração (0 = até fechar)")
     args = p.parse_args()
@@ -181,62 +208,139 @@ def main():
     src = Source(args)
     src.start()
     src.ready.wait(180)
+    if src.size is None:
+        return
     interval = 1.0 / src.fps
-
-    if not args.headless:
-        cv2.namedWindow("framegen", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_NORMAL)
-        if src.size:
-            cv2.resizeWindow("framegen", *src.size)
+    factor = max(1, round(args.target_fps / src.fps))
+    L = 2 * interval - interval / factor          # latência fixa (orçamento = 1 quadro de origem)
+    canvas_w, canvas_h = src.size
 
     fg_on = [True]
-    shown = collections.deque(maxlen=240)     # timestamps das exibições
+    hud_on = [True]
+    qscale = [args.scale]
+    shown = collections.deque(maxlen=240)
     proc_ms = collections.deque(maxlen=60)
-    late = 0
-    n_shown = 0
+    st = dict(late=0, skipped=0, stale=0, errors=0, shown=0)
     pool = ThreadPoolExecutor(2)
-    q = queue.Queue()                         # fila de saída: (hora_de_exibir, quadro, fg)
+    q = queue.Queue()                             # fila de saída: (hora_de_exibir, quadro, fg)
     stop = threading.Event()
     start = time.perf_counter()
 
     def processor():
-        """Thread de processamento: gera o quadro intermediário e agenda a exibição.
-        Latência fixa de 1.5 quadros de origem: mid em +1.0I, cur em +1.5I."""
+        """Gera os quadros intermediários e agenda a exibição.
+        mid_k em t_cap + L - I + k*I/factor ; cur em t_cap + L."""
         last_id = 0
         prev = None
         while prev is None and not stop.is_set():
             prev, _, last_id = src.get(last_id)
+        if prev is not None:
+            prev = letterbox(prev, canvas_w, canvas_h)
+        adapt_n = 0
         while not stop.is_set():
             cur, t_cap, last_id = src.get(last_id)
             if cur is None:
                 continue
-            if fg_on[0]:
-                t0 = time.perf_counter()
-                f_fw = pool.submit(estimate_flow, prev, cur, args.scale)
-                f_bw = pool.submit(estimate_flow, cur, prev, args.scale)
-                mid, _ = interpolate(prev, cur, 0.5, f_fw.result(), f_bw.result(),
-                                     scale=args.scale)
-                proc_ms.append((time.perf_counter() - t0) * 1000)
-                q.put((t_cap + interval, mid, True))
-            q.put((t_cap + 1.5 * interval, cur, fg_on[0]))
+            cur = letterbox(cur, canvas_w, canvas_h)   # janela mudou de tamanho? encaixa
+            if fg_on[0] and factor > 1:
+                try:
+                    t0 = time.perf_counter()
+                    f_fw = pool.submit(estimate_flow, prev, cur, qscale[0])
+                    f_bw = pool.submit(estimate_flow, cur, prev, qscale[0])
+                    fw, bw = f_fw.result(), f_bw.result()
+                    for k in range(1, factor):
+                        when = t_cap + L - interval + k * interval / factor
+                        if time.perf_counter() > when + 0.002:
+                            st["skipped"] += 1             # já passou da hora: não adianta gerar
+                            continue
+                        mid, _ = interpolate(prev, cur, k / factor, fw, bw, scale=qscale[0])
+                        q.put((when, mid, True))
+                    proc_ms.append((time.perf_counter() - t0) * 1000)
+                except Exception as e:
+                    st["errors"] += 1
+                    if st["errors"] <= 3:
+                        print(f"Erro ao gerar quadro: {e}")
+                # qualidade adaptativa: mantém o cálculo dentro do orçamento
+                adapt_n += 1
+                if not args.no_auto and adapt_n >= 8 and len(proc_ms) >= 8:
+                    avg = sum(list(proc_ms)[-8:]) / 8
+                    budget = interval * 1000
+                    if avg > 0.8 * budget and qscale[0] > 0.12:
+                        qscale[0] = max(0.12, qscale[0] - 0.04)
+                        adapt_n = 0
+                    elif avg < 0.45 * budget and qscale[0] < args.scale - 1e-6:
+                        qscale[0] = min(args.scale, qscale[0] + 0.04)
+                        adapt_n = 0
+            q.put((t_cap + L, cur, fg_on[0]))
             prev = cur
 
-    def show(frame, label_on):
-        nonlocal n_shown
-        now = time.perf_counter()
-        n_shown += 1
-        shown.append(now)
-        out_fps = sum(1 for t in shown if now - t <= 1.0)
-        if not args.headless:
-            f = frame.copy()
-            txt = (f"FG {'ON ' if label_on else 'OFF'} | saida {out_fps} fps | fonte {src.fps:.0f} fps"
-                   f" | flow {np.mean(proc_ms) if proc_ms else 0:.0f} ms | atrasos {late} | descartes {src.dropped}")
-            cv2.putText(f, txt, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
-            cv2.putText(f, txt, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
-            cv2.imshow("framegen", f)
-            return cv2.waitKey(1) & 0xFF
-        return -1
+    # ------------------------------------------------ janela
+    zoom = [args.window_scale]
+    fullscreen = [False]
+    win_wh = [0, 0]
 
-    threading.Thread(target=processor, daemon=True).start()
+    def apply_zoom():
+        cv2.resizeWindow(WIN, int(canvas_w * zoom[0]), int(canvas_h * zoom[0]))
+
+    if not args.headless:
+        cv2.namedWindow(WIN, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_NORMAL)
+        apply_zoom()
+
+    def show(frame, label_on):
+        now = time.perf_counter()
+        st["shown"] += 1
+        shown.append(now)
+        if args.headless:
+            return -1
+        if st["shown"] % 15 == 1:                       # tamanho atual da janela
+            _, _, ww, wh = cv2.getWindowImageRect(WIN)
+            win_wh[:] = [ww, wh]
+        view = frame
+        if win_wh[0] > 0 and win_wh[1] > 0:
+            view = letterbox(frame, win_wh[0], win_wh[1])   # mantém a proporção ao redimensionar
+        if hud_on[0]:
+            view = view.copy()
+            out_fps = sum(1 for t in shown if now - t <= 1.0)
+            avg = np.mean(proc_ms) if proc_ms else 0
+            l1 = (f"FG {'ON x' + str(factor) if label_on else 'OFF'} | saida {out_fps} fps"
+                  f" (alvo {src.fps * factor:.0f}) | fonte {src.fps:.0f} fps")
+            l2 = (f"proc {avg:.0f}/{interval * 1000:.0f} ms | escala {qscale[0]:.2f}"
+                  f" | atrasos {st['late']} pulos {st['skipped']} descartes {src.dropped}")
+            for i, txt in enumerate((l1, l2)):
+                y = 22 + i * 20
+                cv2.putText(view, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
+                cv2.putText(view, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        cv2.imshow(WIN, view)
+        return cv2.waitKey(1) & 0xFF
+
+    def handle_key(key):
+        if key in (ord("f"), ord("F")):
+            fg_on[0] = not fg_on[0]
+        elif key in (ord("h"), ord("H")):
+            hud_on[0] = not hud_on[0]
+        elif key in (ord("+"), ord("="), ord("-"), ord("_"), ord("0")):
+            zoom[0] = 1.0 if key == ord("0") else max(0.25, min(4.0, zoom[0] * (
+                1.15 if key in (ord("+"), ord("=")) else 1 / 1.15)))
+            if fullscreen[0]:
+                return
+            apply_zoom()
+            win_wh[:] = [0, 0]
+            st["shown"] = 0                              # força reler o tamanho da janela
+        elif key in (ord("z"), ord("Z")):
+            fullscreen[0] = not fullscreen[0]
+            cv2.setWindowProperty(WIN, cv2.WND_PROP_FULLSCREEN,
+                                  cv2.WINDOW_FULLSCREEN if fullscreen[0] else cv2.WINDOW_NORMAL)
+            if not fullscreen[0]:
+                apply_zoom()
+            st["shown"] = 0
+        elif key == ord("["):
+            qscale[0] = max(0.1, qscale[0] - 0.05)
+            args.scale = max(args.scale, qscale[0]) if args.no_auto else args.scale
+        elif key == ord("]"):
+            qscale[0] = min(0.6, qscale[0] + 0.05)
+            args.scale = max(args.scale, qscale[0])      # o ajuste manual vira o novo teto
+
+    proc_thread = threading.Thread(target=processor, daemon=True)
+    proc_thread.start()
 
     try:
         while True:
@@ -248,25 +352,35 @@ def main():
                 if src.ended:
                     break
                 continue
-            if time.perf_counter() > when + 0.004:
-                late += 1
+            now = time.perf_counter()
+            if now - when > interval:                    # muito velho: descarta em vez de acumular
+                st["stale"] += 1
+                continue
+            if now > when + 0.004:
+                st["late"] += 1
             sleep_until(when)
             key = show(frame, on)
             if key in (ord("q"), 27):
                 break
-            if key in (ord("f"), ord("F")):
-                fg_on[0] = not fg_on[0]
+            if key != 255 and key != -1:
+                handle_key(key)
     finally:
         stop.set()
-        src.ended = True
+        with src.cond:
+            src.ended = True
+            src.cond.notify_all()
+        proc_thread.join(3)                      # espera as threads terminarem antes de sair
+        src.join(3)
+        pool.shutdown(wait=True)
         if not args.headless:
             cv2.destroyAllWindows()
 
     dur = time.perf_counter() - start
-    print(f"\nDuração {dur:.1f}s | exibições {n_shown} | "
-          f"saída ~{n_shown / dur:.0f} fps (fonte {src.fps:.0f}) | "
-          f"flow médio {np.mean(proc_ms) if proc_ms else 0:.0f} ms (orçamento {interval * 1000:.0f} ms) | "
-          f"atrasos {late} | descartes {src.dropped} | resolução {src.size}")
+    print(f"\nDuração {dur:.1f}s | exibições {st['shown']} | "
+          f"saída ~{st['shown'] / dur:.0f} fps (fonte {src.fps:.0f}, alvo {src.fps * factor:.0f}) | "
+          f"proc médio {np.mean(proc_ms) if proc_ms else 0:.0f} ms (orçamento {interval * 1000:.0f} ms) | "
+          f"escala final {qscale[0]:.2f} | atrasos {st['late']} | pulos {st['skipped']} | "
+          f"velhos {st['stale']} | erros {st['errors']} | descartes {src.dropped} | resolução {src.size}")
 
 
 if __name__ == "__main__":
