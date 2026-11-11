@@ -4,16 +4,22 @@ Visualizador de Frame Generation em tempo real (CPU).
 
 Fontes:
   --video arquivo.mp4     reproduz o vídeo em tempo real (funciona em qualquer sessão)
-  --screen                captura a tela (mss; funciona em X11/XWayland)
+  --screen                captura a tela (Wayland: portal + PipeWire; X11: mss)
 
 Teclas na janela:  F = liga/desliga a geração de quadros   Q/Esc = sair
 
 Exemplos:
   python live.py --video demo.mp4
   python live.py --video gameplay.mp4 --width 960 --scale 0.25
-  python live.py --screen --region 0,0,1280,720 --fps 30
+  python live.py --screen --fps 30              # Wayland: escolha a tela/janela no diálogo
+  python live.py --screen --x11 --region 0,0,1280,720   # força mss (só X11)
 """
 import argparse
+import os
+
+# O OpenCV traz Qt sem plugin Wayland: usa XWayland para a janela e evita avisos.
+os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts")
 import collections
 import queue
 import threading
@@ -79,6 +85,19 @@ class Source(threading.Thread):
             return f, t, self.id
 
     def run(self):
+        try:
+            self._run()
+        except Exception as e:                       # erro de captura: avisa e encerra
+            print(f"\nErro na captura: {e}")
+            with self.cond:
+                self.ended = True
+                self.cond.notify_all()
+            self.ready.set()                         # libera a espera do 1º quadro
+
+    def _use_portal(self):
+        return os.environ.get("XDG_SESSION_TYPE") == "wayland" and not self.args.x11
+
+    def _run(self):
         period = 1.0 / self.fps
         nxt = time.perf_counter()
         if self.args.video:
@@ -91,11 +110,34 @@ class Source(threading.Thread):
                 nxt += period
                 time.sleep(max(0.0, nxt - time.perf_counter()))
                 self._publish(self._resize(f))
+        elif self._use_portal():
+            import struct
+            import subprocess
+            import sys
+            here = os.path.dirname(os.path.abspath(__file__))
+            proc = subprocess.Popen(
+                [sys.executable, os.path.join(here, "capture_wayland.py"),
+                 "--width", str(self.args.width), "--fps", str(self.fps)],
+                stdout=subprocess.PIPE)
+
+            def read_exact(n):
+                buf = proc.stdout.read(n)
+                if buf is None or len(buf) < n:
+                    raise RuntimeError("o processo de captura terminou (veja as mensagens acima)")
+                return buf
+
+            try:
+                while not self.ended:
+                    w, h = struct.unpack("<II", read_exact(8))
+                    f = np.frombuffer(read_exact(w * h * 3), np.uint8).reshape(h, w, 3).copy()
+                    self._publish(f)
+            finally:
+                proc.terminate()
         else:
             try:
                 import mss
             except ImportError:
-                raise SystemExit("Instale a captura de tela: pip install mss")
+                raise RuntimeError("Instale a captura de tela: pip install mss")
             with mss.mss() as sct:
                 if self.args.region:
                     x, y, w, h = map(int, self.args.region.split(","))
@@ -125,6 +167,7 @@ def main():
     g.add_argument("--video")
     g.add_argument("--screen", action="store_true")
     p.add_argument("--region", help="x,y,largura,altura (use com --screen)")
+    p.add_argument("--x11", action="store_true", help="força o mss mesmo no Wayland")
     p.add_argument("--monitor", type=int, default=1)
     p.add_argument("--fps", type=float, default=30.0, help="FPS de captura (--screen)")
     p.add_argument("--width", type=int, default=960, help="reduz a largura antes de processar")
@@ -137,11 +180,13 @@ def main():
 
     src = Source(args)
     src.start()
-    src.ready.wait(5)
+    src.ready.wait(180)
     interval = 1.0 / src.fps
 
     if not args.headless:
-        cv2.namedWindow("framegen", cv2.WINDOW_NORMAL)
+        cv2.namedWindow("framegen", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_NORMAL)
+        if src.size:
+            cv2.resizeWindow("framegen", *src.size)
 
     fg_on = [True]
     shown = collections.deque(maxlen=240)     # timestamps das exibições
@@ -157,7 +202,9 @@ def main():
         """Thread de processamento: gera o quadro intermediário e agenda a exibição.
         Latência fixa de 1.5 quadros de origem: mid em +1.0I, cur em +1.5I."""
         last_id = 0
-        prev, _, last_id = src.get(last_id)
+        prev = None
+        while prev is None and not stop.is_set():
+            prev, _, last_id = src.get(last_id)
         while not stop.is_set():
             cur, t_cap, last_id = src.get(last_id)
             if cur is None:
@@ -198,6 +245,8 @@ def main():
             try:
                 when, frame, on = q.get(timeout=0.5)
             except queue.Empty:
+                if src.ended:
+                    break
                 continue
             if time.perf_counter() > when + 0.004:
                 late += 1
